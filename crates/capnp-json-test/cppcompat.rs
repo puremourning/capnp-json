@@ -19,7 +19,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#[cfg(test)]
+// The cppcompat tests shell out to the `capnp` binary; miri can't intercept
+// `std::process::Command::spawn`, so the entire module is skipped under miri.
+#[cfg(all(test, not(miri)))]
 mod tests {
   use std::io::Write;
 

@@ -1,9 +1,14 @@
 [package]
 name = "capnp-json-test"
-version = "0.0.0"
-authors = [ "David Renshaw <dwrenshaw@sandstorm.io>", "Ben Jackson <puremourning@gmail.com>"  ]
 build = "build.rs"
-edition = "2021"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "capnp_json_test"
@@ -15,7 +20,7 @@ capnpc.workspace = true
 [dependencies]
 capnp.workspace = true
 capnpc.workspace = true
-capnp-json = { path = "../" }
+capnp-json.workspace = true
 
 [lints.clippy]
 type_complexity = "allow"

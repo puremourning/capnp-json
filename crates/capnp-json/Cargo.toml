@@ -1,0 +1,27 @@
+[package]
+name = "capnp-json"
+description = "Cap'n Proto JSON codec for capnp-rust"
+documentation = "https://docs.rs/capnp-json"
+readme = "README.md"
+keywords = ["capnp", "capnproto", "json", "codec", "serialization"]
+categories = ["encoding", "network-programming"]
+include = [
+  "src/**/*.rs",
+  "build.rs",
+  "json.capnp",
+  "README.md",
+  "LICENSE",
+]
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+capnp.workspace = true
+
+[build-dependencies]
+capnpc.workspace = true

@@ -34,7 +34,7 @@ pub mod base64 {
 
   pub fn decode(data: &str) -> capnp::Result<Vec<u8>> {
     let bytes = data.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() % 4 != 0 {
       return Err(capnp::Error::failed(
         "Base64 string length must be a multiple of 4".into(),
       ));
@@ -103,7 +103,7 @@ pub mod hex {
   }
 
   pub fn decode(data: &str) -> capnp::Result<Vec<u8>> {
-    if !data.len().is_multiple_of(2) {
+    if data.len() % 2 != 0 {
       return Err(capnp::Error::failed(
         "Hex string must have even length".into(),
       ));

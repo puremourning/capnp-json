@@ -13,9 +13,18 @@ dependencies = [
 
 [[package]]
 name = "capnp-json"
-version = "0.25.0"
+version = "0.1.0"
 dependencies = [
  "capnp",
+ "capnpc",
+]
+
+[[package]]
+name = "capnp-json-test"
+version = "0.1.0"
+dependencies = [
+ "capnp",
+ "capnp-json",
  "capnpc",
 ]
 

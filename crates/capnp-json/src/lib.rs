@@ -1,8 +1,55 @@
-pub mod data;
+//! A [Cap'n Proto](https://capnproto.org) JSON codec, implementing the codec
+//! defined in [`json.capnp`].
+//!
+//! The wire format is compatible with the C++ `capnp::JsonCodec` that ships
+//! with Cap'n Proto: messages encoded by this crate can be decoded by the C++
+//! codec, and vice-versa.
+//!
+//! # Quick start
+//!
+//! ```ignore
+//! use capnp::message;
+//! use capnp_json::{from_json, to_json};
+//!
+//! let mut builder = message::Builder::new_default();
+//! let root: my_schema_capnp::my_struct::Builder<'_> = builder.init_root();
+//! // ... populate `root` ...
+//!
+//! let json: String = to_json(root.reborrow_as_reader())?;
+//!
+//! let mut decoded = message::Builder::new_default();
+//! let decoded_root: my_schema_capnp::my_struct::Builder<'_> =
+//!   decoded.init_root();
+//! from_json(&json, decoded_root)?;
+//! ```
+//!
+//! # JSON annotations
+//!
+//! To use any of the JSON annotations defined in [`json.capnp`] (for example
+//! `$Json.name`, `$Json.flatten`, `$Json.discriminator`, `$Json.base64`,
+//! `$Json.hex`), tell `capnpc` to resolve references to the annotation schema
+//! to this crate from your `build.rs`:
+//!
+//! ```ignore
+//! capnpc::CompilerCommand::new()
+//!     .crate_provides("capnp_json", [0x8ef99297a43a5e34])
+//!     .file("my_schema.capnp")
+//!     .run()
+//!     .expect("compiling schema");
+//! ```
+//!
+//! [`json.capnp`]: https://github.com/capnproto/capnproto/blob/master/c%2B%2B/src/capnp/compat/json.capnp
+
+mod data;
 mod decode;
 mod encode;
 
-capnp::generated_code!(pub mod json_capnp);
+mod schema {
+  capnp::generated_code!(pub mod json_capnp);
+}
+
+#[doc(hidden)]
+pub use schema::json_capnp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DataEncoding {
@@ -94,6 +141,18 @@ impl<'schema, 'prefix> EncodingOptions<'schema, 'prefix> {
   }
 }
 
+/// Encode a Cap'n Proto value as a JSON string.
+///
+/// `reader` accepts anything that converts into a [`capnp::dynamic_value::Reader`]
+/// — typically a struct reader obtained from `message::Reader::get_root()` or
+/// `message::Builder::reborrow_as_reader()`.
+///
+/// `Int64`, `UInt64`, and non-finite floats are encoded as JSON strings, and
+/// `Data` fields are encoded as JSON arrays of bytes by default. The
+/// `$Json.base64` and `$Json.hex` annotations override the `Data` encoding,
+/// and the `$Json.name`, `$Json.flatten`, and `$Json.discriminator`
+/// annotations affect the layout of object fields and unions, all matching
+/// the C++ `capnp::JsonCodec` behaviour.
 pub fn to_json<'reader>(
   reader: impl Into<capnp::dynamic_value::Reader<'reader>>,
 ) -> capnp::Result<String> {
@@ -102,6 +161,16 @@ pub fn to_json<'reader>(
   String::from_utf8(writer.into_inner()).map_err(|e| e.into())
 }
 
+/// Decode a JSON string into a Cap'n Proto struct builder.
+///
+/// `builder` accepts anything that converts into a [`capnp::dynamic_value::Builder`];
+/// the top-level value must be a struct builder, since JSON objects map to
+/// Cap'n Proto structs. The fields and annotations supported are the same as
+/// in [`to_json`].
+///
+/// Returns an error if `json` is malformed, if the top-level JSON value is
+/// not an object, or if any field's value cannot be coerced to its declared
+/// Cap'n Proto type.
 pub fn from_json<'segments>(
   json: &str,
   builder: impl Into<capnp::dynamic_value::Builder<'segments>>,

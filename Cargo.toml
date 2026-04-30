@@ -1,20 +1,19 @@
-[package]
-name = "capnp-json"
-version = "0.25.0"
-authors = [ "Ben Jackson <puremourning@gmail.com>" ]
+[workspace]
+resolver = "2"
+members = [
+  "crates/capnp-json",
+  "crates/capnp-json-test",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81.0"
 license = "MIT"
-description = "implementation of the Cap'n Proto JSON codec in rust"
-repository = "https://github.com/puremourning/canpnp-json"
-documentation = "https://docs.rs/capnp-json/"
-categories = ["network-programming"]
-autoexamples = false
-edition = "2024"
+authors = ["Ben Jackson <puremourning@gmail.com>"]
+repository = "https://github.com/puremourning/capnp-json"
 
-readme = "README.md"
-rust-version = "1.95"
-
-[dependencies]
-capnp = { version = "0.25" }
-
-[build-dependencies]
-capnpc = { version = "0.25" }
+[workspace.dependencies]
+capnp = "0.25"
+capnpc = "0.25"
+capnp-json = { path = "crates/capnp-json" }

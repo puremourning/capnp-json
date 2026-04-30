@@ -1,6 +1,6 @@
 // Deserialisation
 use super::data::{base64, hex};
-use super::{DataEncoding, EncodingOptions, json_capnp};
+use super::{json_capnp, DataEncoding, EncodingOptions};
 
 enum ParseError {
   UnexpectedEndOfInput,
