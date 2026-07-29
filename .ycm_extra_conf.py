@@ -28,6 +28,9 @@ def Settings(**kwargs):
             'type': { 'enable': True },
           }
         },
+        'completion': {
+          'addColonsToModule': False,
+        },
         'workspace': {
           'symbol': {
             'search': {

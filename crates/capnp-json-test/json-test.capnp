@@ -156,3 +156,12 @@ struct NamedDiscriminator {
     sbar @3 :UInt32;
   }
 }
+
+struct TestAnyPointer {
+  anyPointerField @0 :AnyPointer ;
+}
+
+struct TestGeneric(T) {
+  anyPointerField @0 :AnyPointer ;
+  genericField @1 :T ;
+}

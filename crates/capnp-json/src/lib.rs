@@ -40,6 +40,8 @@
 //!
 //! [`json.capnp`]: https://github.com/capnproto/capnproto/blob/master/c%2B%2B/src/capnp/compat/json.capnp
 
+use std::collections::HashMap;
+
 mod data;
 mod decode;
 mod encode;
@@ -59,23 +61,37 @@ enum DataEncoding {
   Hex,
 }
 
-#[derive(Debug)]
 struct EncodingOptions<'schema, 'prefix> {
   prefix:        &'prefix std::borrow::Cow<'schema, str>,
   name:          &'schema str,
+  field:         Option<capnp::schema::Field>,
   flatten:       Option<json_capnp::flatten_options::Reader<'schema>>,
   discriminator: Option<json_capnp::discriminator_options::Reader<'schema>>,
   data_encoding: DataEncoding,
 }
 
+impl Default for EncodingOptions<'_, '_> {
+  fn default() -> Self {
+    Self {
+      prefix:        &std::borrow::Cow::Borrowed(""),
+      name:          "",
+      field:         None,
+      flatten:       None,
+      discriminator: None,
+      data_encoding: DataEncoding::Default,
+    }
+  }
+}
+
 impl<'schema, 'prefix> EncodingOptions<'schema, 'prefix> {
   fn from_field(
     prefix: &'prefix std::borrow::Cow<'schema, str>,
-    field: &capnp::schema::Field,
+    field: capnp::schema::Field,
   ) -> capnp::Result<Self> {
     let mut options = Self {
       prefix,
       name: field.get_proto().get_name()?.to_str()?,
+      field: Some(field),
       flatten: None,
       discriminator: None,
       data_encoding: DataEncoding::Default,
@@ -153,12 +169,10 @@ impl<'schema, 'prefix> EncodingOptions<'schema, 'prefix> {
 /// and the `$Json.name`, `$Json.flatten`, and `$Json.discriminator`
 /// annotations affect the layout of object fields and unions, all matching
 /// the C++ `capnp::JsonCodec` behaviour.
-pub fn to_json<'reader>(
-  reader: impl Into<capnp::dynamic_value::Reader<'reader>>,
+pub fn to_json<'msg>(
+  reader: impl Into<capnp::dynamic_value::Reader<'msg>>,
 ) -> capnp::Result<String> {
-  let mut writer = std::io::Cursor::new(Vec::with_capacity(4096));
-  encode::serialize_json_to(&mut writer, reader)?;
-  String::from_utf8(writer.into_inner()).map_err(|e| e.into())
+  Codec::new().encode(reader)
 }
 
 /// Decode a JSON string into a Cap'n Proto struct builder.
@@ -175,10 +189,154 @@ pub fn from_json<'segments>(
   json: &str,
   builder: impl Into<capnp::dynamic_value::Builder<'segments>>,
 ) -> capnp::Result<()> {
-  let capnp::dynamic_value::Builder::Struct(builder) = builder.into() else {
-    return Err(capnp::Error::failed(
-      "Top-level JSON value must be an object".into(),
-    ));
-  };
-  decode::parse(json, builder)
+  Codec::new().decode(json, builder)
+}
+
+// FIXME: The String valued below could be Cow<'input, str> as they only really
+// need to be allocated if the input contains escaped characters. That would be
+// a little more tricky lower down, but not by a lot.
+pub enum JsonValue {
+  Null,
+  Boolean(bool),
+  Number(f64),
+  String(String),
+  Array(Vec<JsonValue>),
+  Object(HashMap<String, JsonValue>),
+
+  // FIXME: Remove this from the public type and use a wrapper inside decode
+  DataBuffer(Vec<u8>), // HACK: This is so we have somewhere to store the data
+                       // temporarily when we are decoding data fields into
+                       // Readers
+}
+
+/// A trait for encoding and decoding a single field of a Cap'n Proto struct
+/// as JSON. This is used to implement custom encoding/decoding for specific
+/// fields. Importantly, this is required for fields of type `AnyPointer`, which
+/// cannot be automatically encoded/decoded.
+pub trait FieldCodec {
+  fn encode_value(
+    &self,
+    source: capnp::dynamic_value::Reader<'_>,
+  ) -> capnp::Result<JsonValue>;
+  fn decode_value(
+    &self,
+    source: &JsonValue,
+    target: capnp::dynamic_value::Builder<'_>,
+  ) -> capnp::Result<()>;
+}
+
+impl<T: FieldCodec + ?Sized> FieldCodec for &T {
+  fn encode_value(
+    &self,
+    source: capnp::dynamic_value::Reader<'_>,
+  ) -> capnp::Result<JsonValue> {
+    (**self).encode_value(source)
+  }
+  fn decode_value(
+    &self,
+    source: &JsonValue,
+    target: capnp::dynamic_value::Builder<'_>,
+  ) -> capnp::Result<()> {
+    (**self).decode_value(source, target)
+  }
+}
+
+// implement FieldCodec for any (fn, fn) pair that matches the signature
+impl<F, G> FieldCodec for (F, G)
+where
+  F: Fn(capnp::dynamic_value::Reader<'_>) -> capnp::Result<JsonValue>,
+  G: Fn(&JsonValue, capnp::dynamic_value::Builder<'_>) -> capnp::Result<()>,
+{
+  fn encode_value(
+    &self,
+    source: capnp::dynamic_value::Reader<'_>,
+  ) -> capnp::Result<JsonValue> {
+    (self.0)(source)
+  }
+  fn decode_value(
+    &self,
+    source: &JsonValue,
+    target: capnp::dynamic_value::Builder<'_>,
+  ) -> capnp::Result<()> {
+    (self.1)(source, target)
+  }
+}
+
+/// Create a FieldCodec from two functions - an encoder and a decoder.
+/// See [`FieldCodec`] for the required function signatures.
+pub fn make_field_codec<'env>(
+  encode_fn: impl Fn(capnp::dynamic_value::Reader<'_>) -> capnp::Result<JsonValue>
+    + 'env,
+  decode_fn: impl Fn(&JsonValue, capnp::dynamic_value::Builder<'_>) -> capnp::Result<()>
+    + 'env,
+) -> impl FieldCodec + 'env {
+  (encode_fn, decode_fn)
+}
+
+pub struct Codec<'env> {
+  field_overrides: HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
+}
+
+/// A JSON codec for Cap'n Proto messages.
+impl<'env> Codec<'env> {
+  pub fn new() -> Self {
+    Self {
+      field_overrides: HashMap::new(),
+    }
+  }
+
+  pub fn with_field_override(
+    mut self,
+    field: capnp::schema::Field,
+    codec: impl FieldCodec + 'env,
+  ) -> Self {
+    self.field_overrides.insert(field, Box::new(codec));
+    self
+  }
+
+  pub fn encode<'msg>(
+    &self,
+    reader: impl Into<capnp::dynamic_value::Reader<'msg>>,
+  ) -> capnp::Result<String> {
+    let mut writer = std::io::Cursor::new(Vec::with_capacity(4096));
+    self.encode_to(&mut writer, reader)?;
+    String::from_utf8(writer.into_inner()).map_err(|e| {
+      capnp::Error::failed(format!(
+        "Failed to convert JSON bytes to string: {}",
+        e
+      ))
+    })
+  }
+
+  pub fn encode_to<'msg, W: std::io::Write>(
+    &self,
+    writer: &mut W,
+    reader: impl Into<capnp::dynamic_value::Reader<'msg>>,
+  ) -> capnp::Result<()> {
+    let capnp::dynamic_value::Reader::Struct(reader) = reader.into() else {
+      return Err(capnp::Error::failed(
+        "Top-level value must be a struct".into(),
+      ));
+    };
+    encode::serialize_json_to(self, writer, reader)
+  }
+
+  pub fn decode<'segments>(
+    &self,
+    json: &str,
+    builder: impl Into<capnp::dynamic_value::Builder<'segments>>,
+  ) -> capnp::Result<()> {
+    let capnp::dynamic_value::Builder::Struct(builder) = builder.into() else {
+      return Err(capnp::Error::failed(
+        "Top-level JSON value must be an object".into(),
+      ));
+    };
+    decode::parse(self, json, builder)
+  }
+}
+
+impl Default for Codec<'_> {
+  fn default() -> Self {
+    Self::new()
+  }
 }

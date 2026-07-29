@@ -25,21 +25,7 @@ impl From<ParseError> for capnp::Error {
 
 use std::collections::HashMap;
 
-// FIXME: The String valued below could be Cow<'input, str> as they only really
-// need to be allocated if the input contains escaped characters. That would be
-// a little more tricky lower down, but not by a lot.
-enum JsonValue {
-  Null,
-  Boolean(bool),
-  Number(f64),
-  String(String),
-  Array(Vec<JsonValue>),
-  Object(HashMap<String, JsonValue>),
-
-  DataBuffer(Vec<u8>), // HACK: This is so we have somewhere to store the data
-                       // temporarily when we are decoding data fields into
-                       // Readers
-}
+pub use super::JsonValue;
 
 struct Parser<I>
 where
@@ -261,24 +247,19 @@ where
 }
 
 pub fn parse(
+  codec: &super::Codec,
   json: &str,
   builder: capnp::dynamic_struct::Builder<'_>,
 ) -> capnp::Result<()> {
   let mut parser = Parser::new(json.chars());
   let value = parser.parse_value()?;
-  let meta = EncodingOptions {
-    prefix:        &std::borrow::Cow::Borrowed(""),
-    name:          "",
-    flatten:       None,
-    discriminator: None,
-    data_encoding: DataEncoding::Default,
-  };
+  let meta = EncodingOptions::default();
   let JsonValue::Object(mut value) = value else {
     return Err(capnp::Error::failed(
       "Top-level JSON value must be an object".into(),
     ));
   };
-  decode_struct(&mut value, builder, &meta)
+  decode_struct(codec, &mut value, builder, &meta)
 }
 
 fn decode_primitive<'json, 'meta>(
@@ -559,6 +540,7 @@ fn decode_primitive<'json, 'meta>(
 }
 
 fn decode_list(
+  codec: &super::Codec,
   mut field_values: Vec<JsonValue>,
   mut list_builder: capnp::dynamic_list::Builder,
   field_meta: &EncodingOptions,
@@ -576,7 +558,7 @@ fn decode_list(
           .reborrow()
           .get(i as u32)?
           .downcast::<capnp::dynamic_struct::Builder>();
-        decode_struct(&mut item_value, struct_builder, field_meta)?;
+        decode_struct(codec, &mut item_value, struct_builder, field_meta)?;
       }
       Ok(())
     }
@@ -592,7 +574,7 @@ fn decode_list(
           .reborrow()
           .init(i as u32, item_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
-        decode_list(item_value, sub_element_builder, field_meta)?;
+        decode_list(codec, item_value, sub_element_builder, field_meta)?;
       }
       Ok(())
     }
@@ -613,6 +595,7 @@ fn decode_list(
 }
 
 fn decode_struct(
+  codec: &super::Codec,
   value: &mut HashMap<String, JsonValue>,
   mut builder: capnp::dynamic_struct::Builder<'_>,
   meta: &EncodingOptions,
@@ -628,12 +611,22 @@ fn decode_struct(
   };
 
   fn decode_member(
+    codec: &super::Codec,
     mut builder: capnp::dynamic_struct::Builder<'_>,
     field: capnp::schema::Field,
     field_meta: &EncodingOptions,
     value: &mut HashMap<String, JsonValue>,
     value_name: &str,
   ) -> capnp::Result<()> {
+    if let Some(field_codec) = codec.field_overrides.get(&field) {
+      let field_value = match value.remove(value_name) {
+        Some(v) => v,
+        None => return Ok(()),
+      };
+      field_codec.decode_value(&field_value, builder.reborrow().get(field)?)?;
+      return Ok(());
+    }
+
     match field.get_type().which() {
       capnp::introspect::TypeVariant::Struct(_struct_schema) => {
         if field_meta.flatten.is_none() {
@@ -653,7 +646,7 @@ fn decode_struct(
               field_meta.name
             )));
           };
-          decode_struct(&mut field_value, struct_builder, field_meta)?;
+          decode_struct(codec, &mut field_value, struct_builder, field_meta)?;
         } else {
           //
           // FIXME: We should only init this struct if any field is
@@ -671,7 +664,7 @@ fn decode_struct(
             .downcast::<capnp::dynamic_struct::Builder>();
 
           // Flattened struct; pass the JsonValue at this level down
-          decode_struct(value, struct_builder, field_meta)?;
+          decode_struct(codec, value, struct_builder, field_meta)?;
         }
       }
       capnp::introspect::TypeVariant::List(_element_type) => {
@@ -689,7 +682,7 @@ fn decode_struct(
           .reborrow()
           .initn(field, field_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
-        decode_list(field_value, list_builder, field_meta)?;
+        decode_list(codec, field_value, list_builder, field_meta)?;
       }
 
       capnp::introspect::TypeVariant::AnyPointer => {
@@ -718,10 +711,17 @@ fn decode_struct(
   }
 
   for field in builder.get_schema().get_non_union_fields()? {
-    let field_meta = EncodingOptions::from_field(&field_prefix, &field)?;
+    let field_meta = EncodingOptions::from_field(&field_prefix, field)?;
     let field_name = format!("{}{}", field_prefix, field_meta.name);
 
-    decode_member(builder.reborrow(), field, &field_meta, value, &field_name)?;
+    decode_member(
+      codec,
+      builder.reborrow(),
+      field,
+      &field_meta,
+      value,
+      &field_name,
+    )?;
   }
 
   let struct_discriminator = builder
@@ -762,7 +762,7 @@ fn decode_struct(
       // find the first field that exists matching a union field?
       let mut discriminant = None;
       for field in builder.get_schema().get_union_fields()? {
-        let field_meta = EncodingOptions::from_field(meta.prefix, &field)?;
+        let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
         let field_name = format!("{}{}", field_prefix, field_meta.name);
         if value.contains_key(&field_name) {
           discriminant = Some(field_meta.name.to_string());
@@ -775,7 +775,7 @@ fn decode_struct(
 
   if let Some(discriminant) = discriminant {
     for field in builder.get_schema().get_union_fields()? {
-      let field_meta = EncodingOptions::from_field(meta.prefix, &field)?;
+      let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
       if field_meta.name != discriminant {
         continue;
       }
@@ -798,7 +798,14 @@ fn decode_struct(
           .set(field, capnp::dynamic_value::Reader::Void)?;
         break;
       }
-      decode_member(builder.reborrow(), field, &field_meta, value, value_name)?;
+      decode_member(
+        codec,
+        builder.reborrow(),
+        field,
+        &field_meta,
+        value,
+        value_name,
+      )?;
       break;
     }
   }

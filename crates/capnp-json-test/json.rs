@@ -832,4 +832,241 @@ mod tests {
 
     Ok(())
   }
+
+  #[test]
+  fn any_pointer_is_not_encoded() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    let mut v = root
+      .reborrow()
+      .init_any_pointer_field()
+      .init_as::<crate::test_capnp::test_all_types::Builder<'_>>();
+
+    v.set_text_field("Hello");
+
+    let result = json::to_json(root.reborrow_as_reader());
+    assert!(matches!(
+      result,
+      Err(capnp::Error {
+        kind: capnp::ErrorKind::Unimplemented,
+        ..
+      })
+    ));
+    Ok(())
+  }
+
+  #[test]
+  fn any_pointer_is_encoded_with_override() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    let mut v = root
+      .reborrow()
+      .init_any_pointer_field()
+      .init_as::<crate::test_capnp::test_all_types::Builder<'_>>();
+
+    v.set_text_field("Hello");
+
+    let any_pointer_field = {
+      use capnp::introspect::Introspect;
+      let capnp::introspect::TypeVariant::Struct(schema) =
+        crate::json_test_capnp::test_any_pointer::Owned::introspect().which()
+      else {
+        panic!("Expected struct");
+      };
+      capnp::schema::StructSchema::new(schema)
+        .get_field_by_name("anyPointerField")?
+    };
+
+    let s = "Any pointer you like".to_string();
+
+    let codec = json::Codec::new().with_field_override(
+      any_pointer_field,
+      json::make_field_codec(
+        |_reader| Ok(json::JsonValue::String(s.clone())),
+        |_value, _builder| Ok(()),
+      ),
+    );
+
+    let j = codec.encode(root.reborrow_as_reader())?;
+    assert_eq!(r#"{"anyPointerField":"Any pointer you like"}"#, j);
+    Ok(())
+  }
+
+  #[test]
+  fn any_pointer_is_not_decoded() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+
+    let json = r#"{"anyPointerField":{"textField":"Hello"}}"#;
+
+    let result = json::from_json(json, root.reborrow());
+    assert!(matches!(
+      result,
+      Err(capnp::Error {
+        kind: capnp::ErrorKind::Unimplemented,
+        ..
+      })
+    ));
+    Ok(())
+  }
+
+  #[test]
+  fn any_pointer_is_decoded_with_override() -> capnp::Result<()> {
+    let json = r#"{"anyPointerField":{"textField":"Hello"}}"#;
+
+    let any_pointer_field = {
+      use capnp::introspect::Introspect;
+      let capnp::introspect::TypeVariant::Struct(schema) =
+        crate::json_test_capnp::test_any_pointer::Owned::introspect().which()
+      else {
+        panic!("Expected struct");
+      };
+      capnp::schema::StructSchema::new(schema)
+        .get_field_by_name("anyPointerField")?
+    };
+
+    struct MyFieldCodec;
+    impl json::FieldCodec for MyFieldCodec {
+      fn encode_value(
+        &self,
+        _source: capnp::dynamic_value::Reader<'_>,
+      ) -> capnp::Result<json::JsonValue> {
+        Err(capnp::Error::unimplemented("Fail".into()))
+      }
+
+      fn decode_value(
+        &self,
+        source: &json::JsonValue,
+        target: capnp::dynamic_value::Builder<'_>,
+      ) -> capnp::Result<()> {
+        let json::JsonValue::Object(obj) = source else {
+          return Err(capnp::Error::failed(
+            "Expected object for any pointer field".into(),
+          ));
+        };
+
+        let capnp::dynamic_value::Builder::AnyPointer(any_pointer) = target
+        else {
+          return Err(capnp::Error::failed(
+            "Expected any pointer builder".into(),
+          ));
+        };
+
+        let mut builder = any_pointer
+          .init_as::<crate::test_capnp::test_all_types::Builder<'_>>();
+        builder.set_text_field(
+          obj
+            .get("textField")
+            .and_then(|v| match v {
+              json::JsonValue::String(s) => Some(s.as_str()),
+              _ => None,
+            })
+            .ok_or_else(|| {
+              capnp::Error::failed("Expected textField to be a string".into())
+            })?,
+        );
+
+        Ok(())
+      }
+    }
+
+    let codec =
+      json::Codec::new().with_field_override(any_pointer_field, MyFieldCodec);
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+
+    codec.decode(json, root.reborrow())?;
+    let reader = root.reborrow_as_reader();
+
+    let all_types = reader
+      .get_any_pointer_field()
+      .get_as::<crate::test_capnp::test_all_types::Reader<'_>>(
+    )?;
+    assert_eq!("Hello", all_types.get_text_field()?.to_str()?);
+
+    Ok(())
+  }
+
+  #[test]
+  fn test_different_overrides_for_different_brands() -> capnp::Result<()> {
+    let json_text =
+      r#"{"anyPointerField":"Hello, text","genericField":"text"}"#;
+    let json_struct = r#"{"anyPointerField":"Hello, struct","genericField":{"voidField":null,"boolField":false,"int8Field":0,"int16Field":0,"int32Field":0,"int64Field":"0","uInt8Field":0,"uInt16Field":0,"uInt32Field":0,"uInt64Field":"0","float32Field":0,"float64Field":0,"textField":"Hello to you too","enumField":"foo"}}"#;
+
+    let any_pointer_field_text = {
+      use capnp::introspect::Introspect;
+      let capnp::introspect::TypeVariant::Struct(schema) =
+        crate::json_test_capnp::test_generic::Owned::<capnp::text::Owned>::introspect().which()
+      else {
+        panic!("Expected struct");
+      };
+      capnp::schema::StructSchema::new(schema)
+        .get_field_by_name("anyPointerField")?
+    };
+    let any_pointer_field_struct = {
+      use capnp::introspect::Introspect;
+      let capnp::introspect::TypeVariant::Struct(schema) =
+        crate::json_test_capnp::test_generic::Owned::<
+          crate::test_capnp::test_all_types::Owned,
+        >::introspect()
+        .which()
+      else {
+        panic!("Expected struct");
+      };
+      capnp::schema::StructSchema::new(schema)
+        .get_field_by_name("anyPointerField")?
+    };
+
+    assert!(any_pointer_field_text != any_pointer_field_struct);
+
+    let codec = json::Codec::new()
+      .with_field_override(
+        any_pointer_field_text,
+        json::make_field_codec(
+          |_reader| Ok(json::JsonValue::String("Hello, text".to_string())),
+          |_value, _builder| Ok(()),
+        ),
+      )
+      .with_field_override(
+        any_pointer_field_struct,
+        json::make_field_codec(
+          |_reader| Ok(json::JsonValue::String("Hello, struct".to_string())),
+          |_value, _builder| Ok(()),
+        ),
+      );
+
+    let mut builder_text = capnp::message::Builder::new_default();
+    let mut root_text = builder_text
+      .init_root::<crate::json_test_capnp::test_generic::Builder<
+      capnp::text::Owned,
+    >>();
+    root_text
+      .reborrow()
+      .init_any_pointer_field()
+      .set_as::<capnp::text::Owned>("Hello, text")?;
+    root_text.set_generic_field("text")?;
+    assert_eq!(json_text, codec.encode(root_text.reborrow_as_reader())?);
+
+    let mut builder_struct = capnp::message::Builder::new_default();
+    let mut root_struct = builder_struct
+      .init_root::<crate::json_test_capnp::test_generic::Builder<
+      crate::test_capnp::test_all_types::Owned,
+    >>();
+    root_struct
+      .reborrow()
+      .init_any_pointer_field()
+      .set_as::<capnp::text::Owned>("Hello, struct")?;
+    root_struct
+      .reborrow()
+      .init_generic_field()
+      .set_text_field("Hello to you too");
+    assert_eq!(json_struct, codec.encode(root_struct.reborrow_as_reader())?);
+
+    Ok(())
+  }
 }

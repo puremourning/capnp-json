@@ -25,3 +25,7 @@ tag-name = "v{{version}}"
 allow-branch = ["main"]
 pre-release-commit-message = "Release v{{version}}"
 # `capnp-json-test` has `publish = false`, so cargo-release skips it.
+
+[patch.crates-io]
+capnp = { git = "https://github.com/puremourning/capnproto-rust", branch = "json-hashable-field", package = "capnp" }
+capnpc = { git = "https://github.com/puremourning/capnproto-rust", branch = "json-hashable-field", package = "capnpc" }
