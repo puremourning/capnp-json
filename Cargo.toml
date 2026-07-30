@@ -17,3 +17,11 @@ repository = "https://github.com/puremourning/capnp-json"
 capnp = "0.25"
 capnpc = "0.25"
 capnp-json = { path = "crates/capnp-json" }
+
+[workspace.metadata.release]
+# One shared version and a single `vX.Y.Z` tag for the whole workspace.
+shared-version = true
+tag-name = "v{{version}}"
+allow-branch = ["main"]
+pre-release-commit-message = "Release v{{version}}"
+# `capnp-json-test` has `publish = false`, so cargo-release skips it.

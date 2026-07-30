@@ -25,3 +25,9 @@ capnp.workspace = true
 
 [build-dependencies]
 capnpc.workspace = true
+
+[package.metadata.release]
+# Keep the install snippet in the README pinned to the released version.
+pre-release-replacements = [
+  { file = "README.md", search = 'capnp-json = "[^"]+"', replace = 'capnp-json = "{{version}}"', exactly = 1 },
+]
