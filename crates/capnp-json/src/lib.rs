@@ -208,6 +208,7 @@ pub fn from_json<'segments>(
 // FIXME: The String valued below could be Cow<'input, str> as they only really
 // need to be allocated if the input contains escaped characters. That would be
 // a little more tricky lower down, but not by a lot.
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
   Null,
   Boolean(bool),
@@ -297,6 +298,7 @@ pub fn make_field_codec<'env>(
 
 pub struct Codec<'env> {
   field_overrides: HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
+  type_overrides:  HashMap<capnp::introspect::Type, Box<dyn FieldCodec + 'env>>,
   registry:        HashMap<String, Box<dyn FieldCodec + 'env>>,
 }
 
@@ -305,6 +307,7 @@ impl<'env> Codec<'env> {
   pub fn new() -> Self {
     Self {
       field_overrides: HashMap::new(),
+      type_overrides:  HashMap::new(),
       registry:        HashMap::new(),
     }
   }
@@ -315,6 +318,15 @@ impl<'env> Codec<'env> {
     codec: impl FieldCodec + 'env,
   ) -> Self {
     self.field_overrides.insert(field, Box::new(codec));
+    self
+  }
+
+  pub fn with_type_override(
+    mut self,
+    typ: capnp::introspect::Type,
+    codec: impl FieldCodec + 'env,
+  ) -> Self {
+    self.type_overrides.insert(typ, Box::new(codec));
     self
   }
 

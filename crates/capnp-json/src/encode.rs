@@ -22,7 +22,29 @@ where
 fn write_json_value<W: std::io::Write>(
   writer: &mut W,
   value: &JsonValue,
+  meta: &EncodingOptions<'_, '_>,
+  first: &mut bool,
 ) -> capnp::Result<()> {
+  let (flatten, field_prefix) = if let Some(flatten_options) = &meta.flatten {
+    (
+      true,
+      std::borrow::Cow::Owned(format!(
+        "{}{}",
+        meta.prefix,
+        flatten_options.get_prefix()?.to_str()?
+      )),
+    )
+  } else {
+    (false, std::borrow::Cow::Borrowed(""))
+  };
+
+  if flatten && !matches!(value, JsonValue::Object(_)) {
+    return Err(capnp::Error::failed(format!(
+      "Canot encode {}: Flattening is only supported for objects, found {:?}",
+      meta.name, value
+    )));
+  }
+
   match value {
     JsonValue::Null => write!(writer, "null").map_err(|e| e.into()),
     JsonValue::Boolean(v) => {
@@ -42,24 +64,32 @@ fn write_json_value<W: std::io::Write>(
           write!(writer, ",")?;
         }
         first = false;
-        write_json_value(writer, item)?;
+        write_json_value(writer, item, &EncodingOptions::default(), &mut true)?;
       }
       write!(writer, "]")?;
       Ok(())
     }
     JsonValue::Object(hash_map) => {
-      write!(writer, "{{")?;
-      let mut first = true;
+      let mut my_first = true;
+      let first = if !flatten {
+        write!(writer, "{{")?;
+        &mut my_first
+      } else {
+        first
+      };
       for (key, value) in hash_map {
-        if !first {
+        if !*first {
           write!(writer, ",")?;
         }
-        first = false;
-        write_string(writer, key.as_str())?;
+        *first = false;
+        let field_name = format!("{field_prefix}{key}");
+        write_string(writer, field_name.as_str())?;
         write!(writer, ":")?;
-        write_json_value(writer, value)?;
+        write_json_value(writer, value, &EncodingOptions::default(), first)?;
       }
-      write!(writer, "}}")?;
+      if !flatten {
+        write!(writer, "}}")?;
+      }
       Ok(())
     }
     JsonValue::DataBuffer(_items) => Err(capnp::Error::unimplemented(
@@ -78,12 +108,17 @@ fn serialize_value_to<W>(
 where
   W: std::io::Write,
 {
-  if let Some(field_codec) = meta
-    .codec
-    .and_then(|c| codec.registry.get(c))
-    .or_else(|| meta.field.and_then(|f| codec.field_overrides.get(&f)))
+  if let Some(field_codec) =
+    meta.codec.and_then(|c| codec.registry.get(c)).or_else(|| {
+      meta.field.and_then(|f| {
+        codec
+          .field_overrides
+          .get(&f)
+          .or_else(|| codec.type_overrides.get(&f.get_type()))
+      })
+    })
   {
-    write_json_value(writer, &field_codec.encode_value(reader)?)
+    write_json_value(writer, &field_codec.encode_value(reader)?, meta, first)
   } else {
     match reader {
       capnp::dynamic_value::Reader::Void => {
@@ -152,11 +187,12 @@ where
             .downcast::<capnp::text::Reader<'_>>()
             .to_str()?;
           if let Some(field_codec) = codec.registry.get(field_codec) {
-            write_json_value(
+            return write_json_value(
               writer,
               &field_codec.encode_value(reader.into())?,
-            )?;
-            return Ok(());
+              meta,
+              first,
+            );
           }
         }
 

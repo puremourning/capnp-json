@@ -631,7 +631,14 @@ fn decode_struct(
     if let Some(field_codec) = field_meta
       .codec
       .and_then(|c| codec.registry.get(c))
-      .or_else(|| field_meta.field.and_then(|f| codec.field_overrides.get(&f)))
+      .or_else(|| {
+        field_meta.field.and_then(|f| {
+          codec
+            .field_overrides
+            .get(&f)
+            .or_else(|| codec.type_overrides.get(&f.get_type()))
+        })
+      })
     {
       let field_value = match obj.remove(value_name) {
         Some(v) => v,

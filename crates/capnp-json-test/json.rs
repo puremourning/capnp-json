@@ -1280,4 +1280,94 @@ mod tests {
 
     Ok(())
   }
+
+  #[test]
+  fn type_overrides_encode() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_json_annotations::Builder<'_>>(
+    );
+    root.reborrow().init_a_group().set_flat_foo(1234);
+
+    let a_group_field = {
+      use capnp::introspect::Introspect;
+      let capnp::introspect::TypeVariant::Struct(schema) =
+        crate::json_test_capnp::test_json_annotations::Owned::introspect()
+          .which()
+      else {
+        panic!("Expected struct");
+      };
+      capnp::schema::StructSchema::new(schema).get_field_by_name("aGroup")?
+    };
+
+    let codec = json::Codec::new().with_type_override(
+      a_group_field.get_type(),
+      json::make_field_codec(
+        |_reader| {
+          let v = std::collections::HashMap::from([(
+            "aGroup".to_string(),
+            JsonValue::String("Overridden".into()),
+          )]);
+          Ok(JsonValue::Object(v))
+        },
+        |_value, _builder| Ok(()),
+      ),
+    );
+
+    let json = codec.encode(root.reborrow_as_reader())?;
+    assert_eq!(
+      r#"{"aGroup":"Overridden","pfx.renamed-bar":0,"pfx.baz":{"hello":false},"union-type":"foo","multiMember":0,"simpleGroup":{},"unionWithVoid":{"type":"intValue","intValue":0}}"#,
+      json
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn type_overrides_decode() -> capnp::Result<()> {
+    let json = r#"{"aGroup":"Overridden","pfx.renamed-bar":0,"pfx.baz":{"hello":false},"union-type":"foo","multiMember":0,"simpleGroup":{},"unionWithVoid":{"type":"intValue","intValue":0}}"#;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_json_annotations::Builder<'_>>(
+    );
+
+    let a_group_field = {
+      use capnp::introspect::Introspect;
+      let capnp::introspect::TypeVariant::Struct(schema) =
+        crate::json_test_capnp::test_json_annotations::Owned::introspect()
+          .which()
+      else {
+        panic!("Expected struct");
+      };
+      capnp::schema::StructSchema::new(schema).get_field_by_name("aGroup")?
+    };
+
+    let codec = json::Codec::new().with_type_override(
+      a_group_field.get_type(),
+      json::make_field_codec(
+        |_reader| {
+          let v = std::collections::HashMap::from([(
+            "aGroup".to_string(),
+            JsonValue::String("Overridden".into()),
+          )]);
+          Ok(JsonValue::Object(v))
+        },
+        |value, builder| {
+          assert_eq!(
+            JsonValue::String("Overridden".into()),
+            value.clone()
+          );
+          let mut builder = builder.downcast_struct::<crate::json_test_capnp::test_json_annotations::a_group::Owned>();
+          builder.reborrow().set_flat_bar("Overridden");
+          Ok(())
+        }
+      ),
+    );
+
+    codec.decode(json, root.reborrow())?;
+    let reader = root.reborrow_as_reader();
+    assert_eq!("Overridden", reader.get_a_group().get_flat_bar()?.to_str()?);
+
+    Ok(())
+  }
 }
