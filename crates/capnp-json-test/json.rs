@@ -32,6 +32,7 @@ mod cppcompat;
 mod tests {
   use capnp::message;
   use capnp_json as json;
+  use json::JsonValue;
 
   use crate::json_test_capnp::test_json_annotations;
   use crate::test_capnp::{
@@ -884,7 +885,7 @@ mod tests {
     let codec = json::Codec::new().with_field_override(
       any_pointer_field,
       json::make_field_codec(
-        |_reader| Ok(json::JsonValue::String(s.clone())),
+        |_reader| Ok(JsonValue::String(s.clone())),
         |_value, _builder| Ok(()),
       ),
     );
@@ -933,16 +934,16 @@ mod tests {
       fn encode_value(
         &self,
         _source: capnp::dynamic_value::Reader<'_>,
-      ) -> capnp::Result<json::JsonValue> {
+      ) -> capnp::Result<JsonValue> {
         Err(capnp::Error::unimplemented("Fail".into()))
       }
 
       fn decode_value(
         &self,
-        source: &json::JsonValue,
+        source: &JsonValue,
         target: capnp::dynamic_value::Builder<'_>,
       ) -> capnp::Result<()> {
-        let json::JsonValue::Object(obj) = source else {
+        let JsonValue::Object(obj) = source else {
           return Err(capnp::Error::failed(
             "Expected object for any pointer field".into(),
           ));
@@ -961,7 +962,7 @@ mod tests {
           obj
             .get("textField")
             .and_then(|v| match v {
-              json::JsonValue::String(s) => Some(s.as_str()),
+              JsonValue::String(s) => Some(s.as_str()),
               _ => None,
             })
             .ok_or_else(|| {
@@ -1028,14 +1029,14 @@ mod tests {
       .with_field_override(
         any_pointer_field_text,
         json::make_field_codec(
-          |_reader| Ok(json::JsonValue::String("Hello, text".to_string())),
+          |_reader| Ok(JsonValue::String("Hello, text".to_string())),
           |_value, _builder| Ok(()),
         ),
       )
       .with_field_override(
         any_pointer_field_struct,
         json::make_field_codec(
-          |_reader| Ok(json::JsonValue::String("Hello, struct".to_string())),
+          |_reader| Ok(JsonValue::String("Hello, struct".to_string())),
           |_value, _builder| Ok(()),
         ),
       );
@@ -1066,6 +1067,216 @@ mod tests {
       .init_generic_field()
       .set_text_field("Hello to you too");
     assert_eq!(json_struct, codec.encode(root_struct.reborrow_as_reader())?);
+
+    Ok(())
+  }
+
+  #[test]
+  fn custom_codec_encode() -> capnp::Result<()> {
+    let mut msg = capnp::message::Builder::new_default();
+    let mut root = msg.init_root::<crate::json_test_capnp::struct_with_custom_codec::Builder<'_>>();
+
+    root.reborrow().init_struct_level();
+    root.set_field_level("Hello, field level!");
+
+    let codec = json::Codec::new()
+      .with_named_codec(
+        "TestCodec",
+        json::make_field_codec(
+          |_value| {
+            let mut v = std::collections::HashMap::new();
+            v.insert("test".to_string(), JsonValue::String("Inside".into()));
+            Ok(JsonValue::Object(v))
+          },
+          |_value, _builder| Ok(()),
+        ),
+      )
+      .with_named_codec(
+        "TestFieldCodec",
+        json::make_field_codec(
+          |value| {
+            Ok(JsonValue::String(format!(
+              "Hello, {}!",
+              value.downcast::<capnp::text::Reader<'_>>().to_str()?
+            )))
+          },
+          |_value, _builder| Ok(()),
+        ),
+      );
+
+    let json = codec.encode(root.reborrow_as_reader())?;
+
+    assert_eq!(
+      r#"{"structLevel":{"test":"Inside"},"fieldLevel":"Hello, Hello, field level!!"}"#,
+      json
+    );
+
+    Ok(())
+  }
+
+  #[test]
+  fn custom_codec_decode() -> capnp::Result<()> {
+    let json = r#"{"structLevel":{"test":"Inside"},"fieldLevel":{"prefix":"Hello, ","suffix":"!", "value": "World"}}"#;
+
+    let mut msg = capnp::message::Builder::new_default();
+    let mut root = msg.init_root::<crate::json_test_capnp::struct_with_custom_codec::Builder<'_>>();
+
+    struct TestFieldCodec {}
+    impl json::FieldCodec for TestFieldCodec {
+      fn encode_value(
+        &self,
+        _: capnp::dynamic_value::Reader<'_>,
+      ) -> capnp::Result<JsonValue> {
+        todo!()
+      }
+
+      fn decode_value(
+        &self,
+        _source: &JsonValue,
+        _target: capnp::dynamic_value::Builder<'_>,
+      ) -> capnp::Result<()> {
+        todo!()
+      }
+
+      fn decode_member(
+        &self,
+        value: &JsonValue,
+        mut target: capnp::dynamic_struct::Builder<'_>,
+        field: capnp::schema::Field,
+      ) -> capnp::Result<()> {
+        let JsonValue::Object(obj) = value else {
+          return Err(capnp::Error::failed("Expected object".into()));
+        };
+
+        let (prefix, suffix, value) = (
+          obj
+            .get("prefix")
+            .and_then(|v| match v {
+              JsonValue::String(s) => Some(s.as_str()),
+              _ => None,
+            })
+            .ok_or_else(|| {
+              capnp::Error::failed("Expected prefix field".into())
+            })?,
+          obj
+            .get("suffix")
+            .and_then(|v| match v {
+              JsonValue::String(s) => Some(s.as_str()),
+              _ => None,
+            })
+            .ok_or_else(|| {
+              capnp::Error::failed("Expected suffix field".into())
+            })?,
+          obj
+            .get("value")
+            .and_then(|v| match v {
+              JsonValue::String(s) => Some(s.as_str()),
+              _ => None,
+            })
+            .ok_or_else(|| {
+              capnp::Error::failed("Expected value field".into())
+            })?,
+        );
+
+        target.set(
+          field,
+          capnp::dynamic_value::Reader::Text(
+            format!("{}{}{}", prefix, value, suffix).as_str().into(),
+          ),
+        )?;
+
+        Ok(())
+      }
+    }
+
+    let codec = json::Codec::new()
+      .with_named_codec(
+        "TestCodec",
+        json::make_field_codec(
+          |_value| {
+            let mut v = std::collections::HashMap::new();
+            v.insert("test".to_string(), JsonValue::String("Inside".into()));
+            Ok(JsonValue::Object(v))
+          },
+          |value, builder| {
+            let JsonValue::Object(obj) = value else {
+              return Err(capnp::Error::failed("Expected object".into()));
+            };
+            let test_value = obj
+              .get("test")
+              .and_then(|v| match v {
+                JsonValue::String(v) => Some(v),
+                _ => None,
+              })
+              .ok_or_else(|| {
+                capnp::Error::failed("Expected test field".into())
+              })?;
+            let builder = builder.downcast_struct::<crate::json_test_capnp::test_custom_codec::Owned>();
+            builder.get_something().set_as::<capnp::text::Owned>(test_value)?;
+            Ok(())
+          },
+        ),
+      );
+    let codec = codec.with_named_codec("TestFieldCodec", TestFieldCodec {});
+
+    codec.decode(json, root.reborrow())?;
+
+    let reader = root.reborrow_as_reader();
+    assert_eq!(
+      "Inside",
+      reader
+        .get_struct_level()?
+        .get_something()
+        .get_as::<capnp::text::Reader<'_>>()?
+        .to_str()?
+    );
+    assert_eq!("Hello, World!", reader.get_field_level()?);
+
+    Ok(())
+  }
+
+  #[test]
+  fn errors_in_custom_codecs_propagate() -> capnp::Result<()> {
+    let json = r#"{"structLevel":{"test":"Inside"},"fieldLevel":{"prefix":"Hello, ","suffix":"!", "value": "World"}}"#;
+
+    let mut msg = capnp::message::Builder::new_default();
+    let mut root = msg.init_root::<crate::json_test_capnp::struct_with_custom_codec::Builder<'_>>();
+
+    struct FailingCodec {}
+    impl json::FieldCodec for FailingCodec {
+      fn encode_value(
+        &self,
+        _: capnp::dynamic_value::Reader<'_>,
+      ) -> capnp::Result<JsonValue> {
+        Err(capnp::Error::failed("FailingCodec encode".into()))
+      }
+
+      fn decode_value(
+        &self,
+        _source: &JsonValue,
+        _target: capnp::dynamic_value::Builder<'_>,
+      ) -> capnp::Result<()> {
+        Err(capnp::Error::failed("FailingCodec decode".into()))
+      }
+    }
+
+    let codec = json::Codec::new()
+      .with_named_codec("TestCodec", FailingCodec {})
+      .with_named_codec("TestFieldCodec", FailingCodec {});
+
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "FailingCodec decode");
+
+    let result = codec.encode(root.reborrow_as_reader());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "FailingCodec encode");
 
     Ok(())
   }

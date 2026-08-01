@@ -1,5 +1,11 @@
 use super::data::{base64, hex};
-use super::{json_capnp, DataEncoding, EncodingOptions, JsonValue};
+use super::{
+  json_capnp,
+  rust_json_capnp,
+  DataEncoding,
+  EncodingOptions,
+  JsonValue,
+};
 
 pub fn serialize_json_to<'reader, W>(
   codec: &super::Codec,
@@ -13,6 +19,55 @@ where
   serialize_value_to(codec, writer, reader.into(), &meta, &mut true)
 }
 
+fn write_json_value<W: std::io::Write>(
+  writer: &mut W,
+  value: &JsonValue,
+) -> capnp::Result<()> {
+  match value {
+    JsonValue::Null => write!(writer, "null").map_err(|e| e.into()),
+    JsonValue::Boolean(v) => {
+      if *v {
+        write!(writer, "true").map_err(|e| e.into())
+      } else {
+        write!(writer, "false").map_err(|e| e.into())
+      }
+    }
+    JsonValue::Number(v) => write_number(writer, *v),
+    JsonValue::String(v) => write_string(writer, v.as_str()),
+    JsonValue::Array(json_values) => {
+      write!(writer, "[")?;
+      let mut first = true;
+      for item in json_values {
+        if !first {
+          write!(writer, ",")?;
+        }
+        first = false;
+        write_json_value(writer, item)?;
+      }
+      write!(writer, "]")?;
+      Ok(())
+    }
+    JsonValue::Object(hash_map) => {
+      write!(writer, "{{")?;
+      let mut first = true;
+      for (key, value) in hash_map {
+        if !first {
+          write!(writer, ",")?;
+        }
+        first = false;
+        write_string(writer, key.as_str())?;
+        write!(writer, ":")?;
+        write_json_value(writer, value)?;
+      }
+      write!(writer, "}}")?;
+      Ok(())
+    }
+    JsonValue::DataBuffer(_items) => Err(capnp::Error::unimplemented(
+      "DataBuffer is not a valid encoding target".into(),
+    )),
+  }
+}
+
 fn serialize_value_to<W>(
   codec: &super::Codec,
   writer: &mut W,
@@ -23,57 +78,11 @@ fn serialize_value_to<W>(
 where
   W: std::io::Write,
 {
-  if let Some(field_codec) =
-    meta.field.and_then(|f| codec.field_overrides.get(&f))
+  if let Some(field_codec) = meta
+    .codec
+    .and_then(|c| codec.registry.get(c))
+    .or_else(|| meta.field.and_then(|f| codec.field_overrides.get(&f)))
   {
-    fn write_json_value<W: std::io::Write>(
-      writer: &mut W,
-      value: &JsonValue,
-    ) -> capnp::Result<()> {
-      match value {
-        JsonValue::Null => write!(writer, "null").map_err(|e| e.into()),
-        JsonValue::Boolean(v) => {
-          if *v {
-            write!(writer, "true").map_err(|e| e.into())
-          } else {
-            write!(writer, "false").map_err(|e| e.into())
-          }
-        }
-        JsonValue::Number(v) => write_number(writer, *v),
-        JsonValue::String(v) => write_string(writer, v.as_str()),
-        JsonValue::Array(json_values) => {
-          write!(writer, "[")?;
-          let mut first = true;
-          for item in json_values {
-            if !first {
-              write!(writer, ",")?;
-            }
-            first = false;
-            write_json_value(writer, item)?;
-          }
-          write!(writer, "]")?;
-          Ok(())
-        }
-        JsonValue::Object(hash_map) => {
-          write!(writer, "{{")?;
-          let mut first = true;
-          for (key, value) in hash_map {
-            if !first {
-              write!(writer, ",")?;
-            }
-            first = false;
-            write_string(writer, key.as_str())?;
-            write!(writer, ":")?;
-            write_json_value(writer, value)?;
-          }
-          write!(writer, "}}")?;
-          Ok(())
-        }
-        JsonValue::DataBuffer(_items) => Err(capnp::Error::unimplemented(
-          "DataBuffer is not a valid encoding target".into(),
-        )),
-      }
-    }
     write_json_value(writer, &field_codec.encode_value(reader)?)
   } else {
     match reader {
@@ -132,6 +141,25 @@ where
         write_data(writer, data, meta.data_encoding)
       }
       capnp::dynamic_value::Reader::Struct(reader) => {
+        if let Some(field_codec) = reader
+          .get_schema()
+          .get_annotations()?
+          .iter()
+          .find(|a| a.get_id() == rust_json_capnp::codec::ID)
+        {
+          let field_codec = field_codec
+            .get_value()?
+            .downcast::<capnp::text::Reader<'_>>()
+            .to_str()?;
+          if let Some(field_codec) = codec.registry.get(field_codec) {
+            write_json_value(
+              writer,
+              &field_codec.encode_value(reader.into())?,
+            )?;
+            return Ok(());
+          }
+        }
+
         write_object(codec, writer, reader, meta, first)
       }
       capnp::dynamic_value::Reader::List(reader) => {

@@ -1,6 +1,6 @@
 // Deserialisation
 use super::data::{base64, hex};
-use super::{json_capnp, DataEncoding, EncodingOptions};
+use super::{json_capnp, rust_json_capnp, DataEncoding, EncodingOptions};
 
 enum ParseError {
   UnexpectedEndOfInput,
@@ -252,13 +252,8 @@ pub fn parse(
   builder: capnp::dynamic_struct::Builder<'_>,
 ) -> capnp::Result<()> {
   let mut parser = Parser::new(json.chars());
-  let value = parser.parse_value()?;
+  let mut value = parser.parse_value()?;
   let meta = EncodingOptions::default();
-  let JsonValue::Object(mut value) = value else {
-    return Err(capnp::Error::failed(
-      "Top-level JSON value must be an object".into(),
-    ));
-  };
   decode_struct(codec, &mut value, builder, &meta)
 }
 
@@ -547,13 +542,7 @@ fn decode_list(
 ) -> capnp::Result<()> {
   match list_builder.element_type().which() {
     capnp::introspect::TypeVariant::Struct(_sub_element_schema) => {
-      for (i, item_value) in field_values.drain(..).enumerate() {
-        let JsonValue::Object(mut item_value) = item_value else {
-          return Err(capnp::Error::failed(format!(
-            "Expected object for struct list field {}",
-            field_meta.name
-          )));
-        };
+      for (i, mut item_value) in field_values.drain(..).enumerate() {
         let struct_builder = list_builder
           .reborrow()
           .get(i as u32)?
@@ -596,7 +585,7 @@ fn decode_list(
 
 fn decode_struct(
   codec: &super::Codec,
-  value: &mut HashMap<String, JsonValue>,
+  value: &mut JsonValue,
   mut builder: capnp::dynamic_struct::Builder<'_>,
   meta: &EncodingOptions,
 ) -> capnp::Result<()> {
@@ -610,27 +599,55 @@ fn decode_struct(
     std::borrow::Cow::Borrowed("")
   };
 
+  if let Some(field_codec) = builder
+    .get_schema()
+    .get_annotations()?
+    .iter()
+    .find(|a| a.get_id() == rust_json_capnp::codec::ID)
+  {
+    let field_codec = field_codec
+      .get_value()?
+      .downcast::<capnp::text::Reader>()
+      .to_str()?;
+    if let Some(field_codec) = codec.registry.get(field_codec) {
+      return field_codec.decode_value(value, builder.reborrow().into());
+    }
+  }
+
   fn decode_member(
     codec: &super::Codec,
     mut builder: capnp::dynamic_struct::Builder<'_>,
     field: capnp::schema::Field,
     field_meta: &EncodingOptions,
-    value: &mut HashMap<String, JsonValue>,
+    value: &mut JsonValue,
     value_name: &str,
   ) -> capnp::Result<()> {
-    if let Some(field_codec) = codec.field_overrides.get(&field) {
-      let field_value = match value.remove(value_name) {
+    let JsonValue::Object(obj) = value else {
+      return Err(capnp::Error::failed(
+        "Expected object for struct field".into(),
+      ));
+    };
+
+    if let Some(field_codec) = field_meta
+      .codec
+      .and_then(|c| codec.registry.get(c))
+      .or_else(|| field_meta.field.and_then(|f| codec.field_overrides.get(&f)))
+    {
+      let field_value = match obj.remove(value_name) {
         Some(v) => v,
         None => return Ok(()),
       };
-      field_codec.decode_value(&field_value, builder.reborrow().get(field)?)?;
-      return Ok(());
+      return field_codec.decode_member(
+        &field_value,
+        builder.reborrow(),
+        field,
+      );
     }
 
     match field.get_type().which() {
       capnp::introspect::TypeVariant::Struct(_struct_schema) => {
         if field_meta.flatten.is_none() {
-          let field_value = match value.remove(value_name) {
+          let mut field_value = match obj.remove(value_name) {
             Some(v) => v,
             None => return Ok(()),
           };
@@ -640,12 +657,6 @@ fn decode_struct(
             .init(field)?
             .downcast::<capnp::dynamic_struct::Builder>();
 
-          let JsonValue::Object(mut field_value) = field_value else {
-            return Err(capnp::Error::failed(format!(
-              "Expected object for field {}",
-              field_meta.name
-            )));
-          };
           decode_struct(codec, &mut field_value, struct_builder, field_meta)?;
         } else {
           //
@@ -668,7 +679,7 @@ fn decode_struct(
         }
       }
       capnp::introspect::TypeVariant::List(_element_type) => {
-        let Some(field_value) = value.remove(value_name) else {
+        let Some(field_value) = obj.remove(value_name) else {
           return Ok(());
         };
 
@@ -697,7 +708,7 @@ fn decode_struct(
       }
 
       _ => {
-        let Some(mut field_value) = value.remove(value_name) else {
+        let Some(mut field_value) = obj.remove(value_name) else {
           return Ok(());
         };
 
@@ -724,6 +735,12 @@ fn decode_struct(
     )?;
   }
 
+  let JsonValue::Object(obj) = value else {
+    return Err(capnp::Error::failed(
+      "Expected object for struct field".into(),
+    ));
+  };
+
   let struct_discriminator = builder
     .get_schema()
     .get_annotations()?
@@ -747,7 +764,7 @@ fn decode_struct(
         meta.name
       };
       let field_name = format!("{field_prefix}{discriminator_name}");
-      if let Some(JsonValue::String(discriminant)) = value.remove(&field_name) {
+      if let Some(JsonValue::String(discriminant)) = obj.remove(&field_name) {
         Some(discriminant)
       } else {
         None
@@ -764,7 +781,7 @@ fn decode_struct(
       for field in builder.get_schema().get_union_fields()? {
         let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
         let field_name = format!("{}{}", field_prefix, field_meta.name);
-        if value.contains_key(&field_name) {
+        if obj.contains_key(&field_name) {
           discriminant = Some(field_meta.name.to_string());
           break;
         }

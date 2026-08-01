@@ -1,3 +1,5 @@
+import os
+
 def Settings(**kwargs):
   if kwargs['language'] == 'rust':
     return {
@@ -41,4 +43,10 @@ def Settings(**kwargs):
           },
         },
       },
+    }
+  elif kwargs['language'] == 'capnproto':
+    return {
+      'ls': {
+        "importPaths": [os.path.join(os.path.dirname(os.path.abspath(__file__)), "crates", "capnp-json")]
+      }
     }

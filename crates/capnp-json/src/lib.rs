@@ -50,6 +50,8 @@ mod schema {
   capnp::generated_code!(pub mod json_capnp);
 }
 
+capnp::generated_code!(pub mod rust_json_capnp);
+
 #[doc(hidden)]
 pub use schema::json_capnp;
 
@@ -68,6 +70,7 @@ struct EncodingOptions<'schema, 'prefix> {
   flatten:       Option<json_capnp::flatten_options::Reader<'schema>>,
   discriminator: Option<json_capnp::discriminator_options::Reader<'schema>>,
   data_encoding: DataEncoding,
+  codec:         Option<&'schema str>,
 }
 
 impl Default for EncodingOptions<'_, '_> {
@@ -79,6 +82,7 @@ impl Default for EncodingOptions<'_, '_> {
       flatten:       None,
       discriminator: None,
       data_encoding: DataEncoding::Default,
+      codec:         None,
     }
   }
 }
@@ -95,10 +99,19 @@ impl<'schema, 'prefix> EncodingOptions<'schema, 'prefix> {
       flatten: None,
       discriminator: None,
       data_encoding: DataEncoding::Default,
+      codec: None,
     };
 
     for anno in field.get_annotations()?.iter() {
       match anno.get_id() {
+        rust_json_capnp::codec::ID => {
+          options.codec = Some(
+            anno
+              .get_value()?
+              .downcast::<capnp::text::Reader>()
+              .to_str()?,
+          );
+        }
         json_capnp::name::ID => {
           options.name = anno
             .get_value()?
@@ -223,6 +236,15 @@ pub trait FieldCodec {
     source: &JsonValue,
     target: capnp::dynamic_value::Builder<'_>,
   ) -> capnp::Result<()>;
+
+  fn decode_member(
+    &self,
+    source: &JsonValue,
+    target: capnp::dynamic_struct::Builder<'_>,
+    field: capnp::schema::Field,
+  ) -> capnp::Result<()> {
+    self.decode_value(source, target.init(field)?)
+  }
 }
 
 impl<T: FieldCodec + ?Sized> FieldCodec for &T {
@@ -275,6 +297,7 @@ pub fn make_field_codec<'env>(
 
 pub struct Codec<'env> {
   field_overrides: HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
+  registry:        HashMap<String, Box<dyn FieldCodec + 'env>>,
 }
 
 /// A JSON codec for Cap'n Proto messages.
@@ -282,6 +305,7 @@ impl<'env> Codec<'env> {
   pub fn new() -> Self {
     Self {
       field_overrides: HashMap::new(),
+      registry:        HashMap::new(),
     }
   }
 
@@ -291,6 +315,15 @@ impl<'env> Codec<'env> {
     codec: impl FieldCodec + 'env,
   ) -> Self {
     self.field_overrides.insert(field, Box::new(codec));
+    self
+  }
+
+  pub fn with_named_codec(
+    mut self,
+    name: impl Into<String>,
+    codec: impl FieldCodec + 'env,
+  ) -> Self {
+    self.registry.insert(name.into(), Box::new(codec));
     self
   }
 
