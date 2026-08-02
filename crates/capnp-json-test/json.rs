@@ -1072,6 +1072,26 @@ mod tests {
   }
 
   #[test]
+  fn any_pointer_null_does_not_prevent_encoding() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    let json = json::to_json(root.reborrow_as_reader())?;
+    assert_eq!(r#"{}"#, json);
+    Ok(())
+  }
+
+  #[test]
+  fn any_pointer_null_does_not_prevent_decoding() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    json::from_json(r#"{}"#, root.reborrow())?;
+    assert!(root.get_any_pointer_field().is_null());
+    Ok(())
+  }
+
+  #[test]
   fn custom_codec_encode() -> capnp::Result<()> {
     let mut msg = capnp::message::Builder::new_default();
     let mut root = msg.init_root::<crate::json_test_capnp::struct_with_custom_codec::Builder<'_>>();
