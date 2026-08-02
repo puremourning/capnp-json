@@ -631,6 +631,14 @@ impl<T: FieldCodec + ?Sized> FieldCodec for &T {
   ) -> capnp::Result<()> {
     (**self).decode_value(source, target)
   }
+  fn decode_member(
+    &self,
+    source: &JsonValue,
+    target: capnp::dynamic_struct::Builder<'_>,
+    field: capnp::schema::Field,
+  ) -> capnp::Result<()> {
+    (**self).decode_member(source, target, field)
+  }
 }
 
 /// A pair of closures `(encode, decode)` is a [`FieldCodec`]. Usually reached
