@@ -2281,4 +2281,30 @@ mod tests {
     assert_eq!(root.reborrow_as_reader().get_int8_field(), 42);
     Ok(())
   }
+
+  #[test]
+  fn trailing_whitespace_is_accepted() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = "  \n\t  {\"int8Field\":7}  \n\t  ";
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(json, root.reborrow())?;
+    assert_eq!(root.reborrow_as_reader().get_int8_field(), 7);
+    Ok(())
+  }
+
+  #[test]
+  fn trailing_data_is_rejected() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = r#"{"int8Field":7}  \n\t  {"int8Field":8}"#;
+    let mut builder = message::Builder::new_default();
+    let root: test_json_types::Builder<'_> = builder.init_root();
+    let Err(e) = json::from_json(json, root) else {
+      panic!("expected trailing data to be rejected");
+    };
+    assert_eq!(e.extra, "Trailing characters after JSON value");
+    Ok(())
+  }
 }

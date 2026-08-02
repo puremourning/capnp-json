@@ -351,6 +351,12 @@ pub(crate) fn parse(
 ) -> capnp::Result<()> {
   let mut parser = Parser::new(json.chars());
   let mut value = parser.parse_value(&codec.options, 0)?;
+  parser.discard_whitespace();
+  if parser.peek().is_some() {
+    return Err(capnp::Error::failed(
+      "Trailing characters after JSON value".into(),
+    ));
+  }
   let meta = EncodingOptions::default();
   decode_struct(0, codec, &mut value, builder, &meta)
 }
