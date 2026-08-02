@@ -1370,4 +1370,449 @@ mod tests {
 
     Ok(())
   }
+
+  #[test]
+  fn recursion_level_limit() -> capnp::Result<()> {
+    let codec = json::Codec::new_with_options(json::CodecOptions {
+      recursion_limit: 2,
+      ..Default::default()
+    });
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+
+    let json = r#"{"anyPointerField":[[["too deep"]]]}"#;
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+
+    let json = r#"{"anyPointerField":{"anyPointerField":{"anyPointerField":"too deep"}}}"#;
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+
+    let json = r#"{"anyPointerField":[{"anyPointerField":{"anyPointerField":"too deep"}}]}"#;
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+
+    Ok(())
+  }
+
+  // ---------------------------------------------------------------------
+  // Recursion limits
+  //
+  // Two independent limits guard against unbounded recursion while decoding:
+  // the parser's, which bounds the depth of the `JsonValue` tree it builds,
+  // and `decode_struct`'s, which bounds how deep the schema walk descends.
+  // The second is not redundant: a struct that flattens a field of its own
+  // type recurses on the schema without descending into the JSON at all, so
+  // the parser's limit can never fire for it.
+  // ---------------------------------------------------------------------
+
+  /// The default matches the C++ codec's `maxNestingDepth`.
+  #[test]
+  fn recursion_limit_default_matches_cpp() {
+    assert_eq!(json::CodecOptions::default().recursion_limit, 64);
+  }
+
+  /// Nesting one JSON object per schema level: the boundary is exact, and
+  /// input one level inside it still decodes correctly.
+  #[test]
+  fn recursion_limit_object_nesting_boundary() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_struct;
+
+    fn nested(depth: usize) -> String {
+      let mut s = String::new();
+      for _ in 0..depth {
+        s.push_str(r#"{"inner":"#);
+      }
+      s.push_str(r#"{"value":7}"#);
+      for _ in 0..depth {
+        s.push('}');
+      }
+      s
+    }
+
+    let codec = json::Codec::new();
+    let limit = json::CodecOptions::default().recursion_limit;
+
+    // `nested(d)` writes d `{"inner":` wrappers around a `{"value":7}` leaf,
+    // so it contains d + 1 objects in total. A `recursion_limit` of N admits
+    // N nested containers, which is exactly what `capnp convert` accepts at
+    // the same setting: 64 objects through, 65 rejected.
+    let deepest_accepted = limit - 1;
+
+    // At the limit: accepted, and the value at the bottom survives.
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<self_struct::Builder<'_>>();
+    codec.decode(&nested(deepest_accepted), root.reborrow())?;
+    let mut cursor = root.reborrow_as_reader();
+    for _ in 0..deepest_accepted {
+      cursor = cursor.get_inner()?;
+    }
+    assert_eq!(cursor.get_value(), 7, "value at the bottom must survive");
+
+    // One past it: rejected rather than overflowing the stack.
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<self_struct::Builder<'_>>();
+    let Err(e) = codec.decode(&nested(deepest_accepted + 1), root) else {
+      panic!("expected the recursion limit to reject this");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert!(
+      e.extra.contains("Recursion limit exceeded"),
+      "unexpected error: {}",
+      e.extra
+    );
+    Ok(())
+  }
+
+  /// `validate_schema` reports cyclic flattening the way the C++ codec does.
+  /// `$Json.flatten` splices members into the parent object rather than
+  /// nesting them, so a cycle of flattened fields describes an object of
+  /// infinite width.
+  ///
+  /// It is a property of the schema, not of the data, so it holds for a type
+  /// nothing has been written to.
+  #[test]
+  fn validate_schema_reports_cyclic_flattening() {
+    use crate::json_test_capnp::cyclic_flatten;
+
+    let Err(e) = json::validate_schema::<cyclic_flatten::Owned>() else {
+      panic!("expected cyclic flattening to be reported");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert!(
+      e.extra.starts_with("cyclic JSON flattening detected"),
+      "unexpected error: {}",
+      e.extra
+    );
+  }
+
+  /// Encoding and decoding do not run the schema check, so a cyclic schema is
+  /// not reported as such there. It is still rejected on decode -- by the
+  /// recursion limit, which is what guarantees decoding terminates -- just
+  /// with a message about depth rather than about the cycle.
+  #[test]
+  fn cyclic_flatten_is_not_checked_by_decode() {
+    use crate::json_test_capnp::cyclic_flatten;
+
+    for json in [r#"{}"#, r#"{"value":1}"#, r#"{"i.value":1}"#] {
+      let mut builder = capnp::message::Builder::new_default();
+      let root = builder.init_root::<cyclic_flatten::Builder<'_>>();
+      let Err(e) = json::Codec::new().decode(json, root) else {
+        panic!("expected {json} to be rejected");
+      };
+      assert_eq!(e.kind, capnp::ErrorKind::Failed);
+      assert_eq!(e.extra, "Recursion limit exceeded while decoding JSON");
+    }
+  }
+
+  /// Encoding a cyclic schema terminates on its own: an unset pointer field is
+  /// skipped rather than descended into, so there is nothing for the check to
+  /// save us from here.
+  #[test]
+  fn cyclic_flatten_encodes() -> capnp::Result<()> {
+    use crate::json_test_capnp::cyclic_flatten;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<cyclic_flatten::Builder<'_>>();
+    root.set_value(1);
+    assert_eq!(json::to_json(root.reborrow_as_reader())?, r#"{"value":1}"#);
+
+    root.reborrow().init_inner().set_value(2);
+    assert_eq!(
+      json::to_json(root.reborrow_as_reader())?,
+      r#"{"i.value":2,"value":1}"#
+    );
+    Ok(())
+  }
+
+  /// Which schemas count as cyclic, checked against the verdict `capnp
+  /// convert` gives for each shape.
+  #[test]
+  fn cyclic_flatten_matches_cpp_verdicts() -> capnp::Result<()> {
+    use crate::json_test_capnp::{
+      cyclic_flatten,
+      flatten_through_group,
+      mutual_flatten_a,
+      mutual_one_flat_a,
+      references_cyclic,
+      references_cyclic_via_list,
+      self_struct,
+    };
+
+    // Cyclic: a struct flattening its own type.
+    assert!(json::validate_schema::<cyclic_flatten::Owned>().is_err());
+    // Cyclic: a group is an edge even when it is not itself flattened.
+    assert!(json::validate_schema::<flatten_through_group::Owned>().is_err());
+    // Cyclic: A -> B -> A, both flattened.
+    assert!(json::validate_schema::<mutual_flatten_a::Owned>().is_err());
+    // Cyclic: reachable through a plain field, and through a list element
+    // type. C++ loads handlers for the whole dependency graph, so these are
+    // rejected even though the root itself flattens nothing.
+    assert!(json::validate_schema::<references_cyclic::Owned>().is_err());
+    assert!(
+      json::validate_schema::<references_cyclic_via_list::Owned>().is_err()
+    );
+
+    // Not cyclic: the return edge is a plain field, so it nests and
+    // flattening terminates.
+    json::validate_schema::<mutual_one_flat_a::Owned>()?;
+    // Not cyclic: plain self-reference without any flattening.
+    json::validate_schema::<self_struct::Owned>()?;
+    Ok(())
+  }
+
+  /// The check must not be over-eager: the schemas this crate exercises
+  /// everywhere else flatten legitimately and must all pass.
+  #[test]
+  fn validate_schema_accepts_ordinary_schemas() -> capnp::Result<()> {
+    use crate::test_capnp::{
+      test_json_flatten_union,
+      test_json_types,
+      test_union,
+      test_unnamed_union,
+    };
+
+    json::validate_schema::<test_json_types::Owned>()?;
+    json::validate_schema::<test_json_flatten_union::Owned>()?;
+    json::validate_schema::<test_union::Owned>()?;
+    json::validate_schema::<test_unnamed_union::Owned>()?;
+    json::validate_schema::<test_json_annotations::Owned>()?;
+    Ok(())
+  }
+
+  /// A schema that flattens without cycling still works, so the check has not
+  /// simply banned flattening.
+  #[test]
+  fn non_cyclic_flatten_still_round_trips() -> capnp::Result<()> {
+    use crate::json_test_capnp::mutual_one_flat_a;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<mutual_one_flat_a::Builder<'_>>();
+    root.set_value(9);
+    {
+      let mut b = root.reborrow().init_b();
+      b.set_other(4);
+      b.reborrow().init_a().set_value(3);
+    }
+    let encoded = json::to_json(root.reborrow_as_reader())?;
+    assert_eq!(encoded, r#"{"a":{"value":3},"other":4,"value":9}"#);
+
+    let mut rt = capnp::message::Builder::new_default();
+    let mut rt_root = rt.init_root::<mutual_one_flat_a::Builder<'_>>();
+    json::Codec::new().decode(&encoded, rt_root.reborrow())?;
+
+    let r = rt_root.reborrow_as_reader();
+    assert_eq!(r.get_value(), 9);
+    assert_eq!(r.get_b()?.get_other(), 4);
+    assert_eq!(r.get_b()?.get_a()?.get_value(), 3);
+
+    // Re-encoding does not reproduce the input byte-for-byte: decoding always
+    // initialises a flattened struct field, even when no member of it was
+    // present, so the inner `a`'s own flattened `b` now exists and its
+    // members appear on the way back out. That is the pre-existing
+    // `decode_struct` FIXME, not an effect of the cycle check -- recorded
+    // here so the day it is fixed this test says so.
+    assert_eq!(
+      json::to_json(rt_root.reborrow_as_reader())?,
+      r#"{"a":{"other":0,"value":3},"other":4,"value":9}"#,
+      "flattened struct fields are still eagerly initialised on decode"
+    );
+    Ok(())
+  }
+
+  /// Self-reference through `List(Struct)`, which alternates arrays and
+  /// objects. Bounded, and legal input inside the limit still round-trips.
+  #[test]
+  fn recursion_limit_list_of_structs() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_list;
+
+    fn nested(depth: usize) -> String {
+      let mut s = String::new();
+      for _ in 0..depth {
+        s.push_str(r#"{"children":["#);
+      }
+      s.push_str(r#"{"value":7}"#);
+      for _ in 0..depth {
+        s.push_str("]}");
+      }
+      s
+    }
+
+    let codec = json::Codec::new();
+
+    // Comfortably inside the limit: decodes, and the leaf survives.
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<self_list::Builder<'_>>();
+    codec.decode(&nested(20), root.reborrow())?;
+    let mut cursor = root.reborrow_as_reader();
+    for _ in 0..20 {
+      cursor = cursor.get_children()?.get(0);
+    }
+    assert_eq!(cursor.get_value(), 7);
+
+    // Far outside it: an error, not a stack overflow.
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<self_list::Builder<'_>>();
+    // 100 levels is 200 JSON containers, comfortably past the limit of 64,
+    // and cheap enough for miri.
+    let far_past_limit = if cfg!(miri) { 100 } else { 500 };
+    let Err(e) = codec.decode(&nested(far_past_limit), root) else {
+      panic!("expected the recursion limit to reject this");
+    };
+    assert!(
+      e.extra.contains("Recursion limit exceeded"),
+      "unexpected error: {}",
+      e.extra
+    );
+    Ok(())
+  }
+
+  /// Nested lists, which recurse through `decode_list` rather than
+  /// `decode_struct`.
+  #[test]
+  fn recursion_limit_nested_lists() -> capnp::Result<()> {
+    use crate::test_capnp::test_complex_list;
+
+    let depth = if cfg!(miri) { 100 } else { 500 };
+    let mut json = String::from(r#"{"primListListList":"#);
+    for _ in 0..depth {
+      json.push('[');
+    }
+    for _ in 0..depth {
+      json.push(']');
+    }
+    json.push('}');
+
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<test_complex_list::Builder<'_>>();
+    let Err(e) = json::Codec::new().decode(&json, root) else {
+      panic!("expected the recursion limit to reject this");
+    };
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    Ok(())
+  }
+
+  /// A hostile payload that is nothing but nesting must be rejected quickly
+  /// rather than aborting the process. This is the case that motivated the
+  /// limit; before it existed this test crashed the whole test binary.
+  #[test]
+  fn deeply_nested_hostile_input_does_not_abort() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_struct;
+
+    // Miri interprets every character of the parse, so the huge sizes take
+    // far too long there. The limit fires at 64, so 1_000 already proves the
+    // point; the larger sizes exist to show the cost stays bounded.
+    const DEPTHS: &[usize] = if cfg!(miri) {
+      &[1_000]
+    } else {
+      &[1_000, 100_000, 1_000_000]
+    };
+
+    for &depth in DEPTHS {
+      let mut json = String::from(r#"{"inner":"#);
+      for _ in 0..depth {
+        json.push('[');
+      }
+      let mut builder = capnp::message::Builder::new_default();
+      let root = builder.init_root::<self_struct::Builder<'_>>();
+      let Err(e) = json::Codec::new().decode(&json, root) else {
+        panic!("expected depth {depth} to be rejected");
+      };
+      assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    }
+    Ok(())
+  }
+
+  /// The limit is configurable in both directions.
+  #[test]
+  fn recursion_limit_is_configurable() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_struct;
+
+    let json = r#"{"inner":{"inner":{"value":7}}}"#;
+
+    // Three levels of object nesting; a limit of 2 rejects it.
+    let codec = json::Codec::new_with_options(json::CodecOptions {
+      recursion_limit: 2,
+      ..Default::default()
+    });
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<self_struct::Builder<'_>>();
+    assert!(codec.decode(json, root).is_err());
+
+    // A limit of 8 accepts it.
+    let codec = json::Codec::new_with_options(json::CodecOptions {
+      recursion_limit: 8,
+      ..Default::default()
+    });
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<self_struct::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+    assert_eq!(
+      root
+        .reborrow_as_reader()
+        .get_inner()?
+        .get_inner()?
+        .get_value(),
+      7
+    );
+    Ok(())
+  }
+
+  /// `to_json` and `from_json` share one cached codec per thread rather than
+  /// building one per call, so exercise them from several threads at once:
+  /// each thread must warm its own cache and produce the same answer.
+  #[test]
+  fn convenience_api_is_usable_from_many_threads() {
+    use crate::test_capnp::test_json_types;
+
+    let expected = {
+      let mut builder = message::Builder::new_default();
+      let mut root: test_json_types::Builder<'_> = builder.init_root();
+      root.set_int8_field(-8);
+      root.set_text_field("hello");
+      json::to_json(root.reborrow_as_reader()).unwrap()
+    };
+
+    let (workers, iterations) = if cfg!(miri) { (2, 5) } else { (8, 200) };
+    let threads: Vec<_> = (0..workers)
+      .map(|_| {
+        let expected = expected.clone();
+        std::thread::spawn(move || {
+          for _ in 0..iterations {
+            let mut builder = message::Builder::new_default();
+            let mut root: test_json_types::Builder<'_> = builder.init_root();
+            root.set_int8_field(-8);
+            root.set_text_field("hello");
+            assert_eq!(
+              json::to_json(root.reborrow_as_reader()).unwrap(),
+              expected
+            );
+
+            let mut rt = message::Builder::new_default();
+            let mut rt_root: test_json_types::Builder<'_> = rt.init_root();
+            json::from_json(&expected, rt_root.reborrow()).unwrap();
+            assert_eq!(rt_root.reborrow_as_reader().get_int8_field(), -8);
+          }
+        })
+      })
+      .collect();
+
+    for t in threads {
+      t.join().expect("worker thread panicked");
+    }
+  }
 }

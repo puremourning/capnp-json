@@ -78,6 +78,13 @@ struct MyStruct {
   - `$Json.name` &mdash; rename a field, enumerant, method, group, or union
     member in the JSON representation.
   - `$Json.flatten` &mdash; flatten a struct, group, or union into its parent.
+    Flattening must terminate: a schema that flattens a field of its own type,
+    directly or through a chain, cannot be represented as JSON. Call
+    `capnp_json::validate_schema::<MyStruct::Owned>()` once (from a test, or at
+    startup) to get the same "cyclic JSON flattening detected" verdict the C++
+    codec gives. Encoding and decoding skip the check, since a schema is
+    compile-time data; a cyclic schema is still rejected when decoded, just via
+    the recursion limit.
   - `$Json.discriminator` &mdash; encode a union's variant as a sibling
     discriminator field.
   - `$Json.base64` / `$Json.hex` &mdash; encode `Data` fields as Base64 or
@@ -102,9 +109,6 @@ struct MyStruct {
 These matter mainly when decoding input you do not control; see the crate
 documentation for the full list.
 
-- **No JSON nesting depth limit.** The parser is recursive, so deeply nested
-  input can exhaust the stack and abort the process. The C++ codec caps
-  nesting at 64 levels. Bound the nesting depth of untrusted input yourself.
 - Input after the top-level value is ignored rather than rejected.
 - Out-of-range numbers saturate to the target integer type instead of raising
   an error.

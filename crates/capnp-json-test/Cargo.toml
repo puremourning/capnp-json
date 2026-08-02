@@ -23,6 +23,9 @@ capnpc.workspace = true
 capnp-json.workspace = true
 
 [lints.clippy]
+# `CodecOptions { .., ..Default::default() }` is the forward-compatible way to
+# build an options struct, but reads as needless while it has a single field.
+needless_update = "allow"
 type_complexity = "allow"
 extra_unused_type_parameters = "allow"
 match_single_binding = "allow"

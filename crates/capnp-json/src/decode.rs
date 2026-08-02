@@ -93,7 +93,29 @@ where
     }
   }
 
-  fn parse_value(&mut self) -> capnp::Result<JsonValue> {
+  /// Parse one JSON value.
+  ///
+  /// `recursion_level` counts the arrays and objects already entered, not the
+  /// values parsed, so that a scalar does not cost a level of its own. This
+  /// matches the C++ codec, whose `nestingDepth` is incremented only by
+  /// `parseArray` and `parseObject`; counting scalars too would make the same
+  /// numeric limit one level stricter than C++'s.
+  fn parse_value(
+    &mut self,
+    options: &crate::CodecOptions,
+    recursion_level: usize,
+  ) -> capnp::Result<JsonValue> {
+    // Entering a container takes the depth to `recursion_level + 1`, so the
+    // limit is reached when `recursion_level` has caught up with it.
+    let check_container_depth = || {
+      if recursion_level >= options.recursion_limit {
+        return Err(capnp::Error::failed(
+          "Recursion limit exceeded while parsing JSON".into(),
+        ));
+      }
+      Ok(())
+    };
+
     match self.peek_next() {
       None => Err(ParseError::UnexpectedEndOfInput.into()),
       Some('n') => {
@@ -127,6 +149,7 @@ where
         Ok(JsonValue::Number(num))
       }
       Some('[') => {
+        check_container_depth()?;
         self.advance()?;
         let mut items = Vec::new();
         let mut require_comma = false;
@@ -135,13 +158,14 @@ where
             self.consume(',')?;
           }
           require_comma = true;
-          let item = self.parse_value()?;
+          let item = self.parse_value(options, recursion_level + 1)?;
           items.push(item);
         }
         self.consume_next(']')?;
         Ok(JsonValue::Array(items))
       }
       Some('{') => {
+        check_container_depth()?;
         self.advance()?;
         let mut members = HashMap::new();
         let mut require_comma = false;
@@ -152,7 +176,7 @@ where
           require_comma = true;
           let key = self.parse_string()?;
           self.consume_next(':')?;
-          let value = self.parse_value()?;
+          let value = self.parse_value(options, recursion_level + 1)?;
           if members.insert(key.clone(), value).is_some() {
             return Err(
               ParseError::Other(format!("Duplicate key in object: {key}"))
@@ -252,9 +276,9 @@ pub(crate) fn parse(
   builder: capnp::dynamic_struct::Builder<'_>,
 ) -> capnp::Result<()> {
   let mut parser = Parser::new(json.chars());
-  let mut value = parser.parse_value()?;
+  let mut value = parser.parse_value(&codec.options, 0)?;
   let meta = EncodingOptions::default();
-  decode_struct(codec, &mut value, builder, &meta)
+  decode_struct(0, codec, &mut value, builder, &meta)
 }
 
 fn decode_primitive<'json, 'meta>(
@@ -535,6 +559,7 @@ fn decode_primitive<'json, 'meta>(
 }
 
 fn decode_list(
+  recursion_level: usize,
   codec: &super::Codec,
   mut field_values: Vec<JsonValue>,
   mut list_builder: capnp::dynamic_list::Builder,
@@ -547,7 +572,13 @@ fn decode_list(
           .reborrow()
           .get(i as u32)?
           .downcast::<capnp::dynamic_struct::Builder>();
-        decode_struct(codec, &mut item_value, struct_builder, field_meta)?;
+        decode_struct(
+          recursion_level + 1,
+          codec,
+          &mut item_value,
+          struct_builder,
+          field_meta,
+        )?;
       }
       Ok(())
     }
@@ -563,7 +594,13 @@ fn decode_list(
           .reborrow()
           .init(i as u32, item_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
-        decode_list(codec, item_value, sub_element_builder, field_meta)?;
+        decode_list(
+          recursion_level + 1,
+          codec,
+          item_value,
+          sub_element_builder,
+          field_meta,
+        )?;
       }
       Ok(())
     }
@@ -584,11 +621,18 @@ fn decode_list(
 }
 
 fn decode_struct(
+  recursion_level: usize,
   codec: &super::Codec,
   value: &mut JsonValue,
   mut builder: capnp::dynamic_struct::Builder<'_>,
   meta: &EncodingOptions,
 ) -> capnp::Result<()> {
+  if recursion_level > codec.options.recursion_limit {
+    return Err(capnp::Error::failed(
+      "Recursion limit exceeded while decoding JSON".into(),
+    ));
+  }
+
   let field_prefix = if let Some(flatten_options) = &meta.flatten {
     std::borrow::Cow::Owned(format!(
       "{}{}",
@@ -615,6 +659,7 @@ fn decode_struct(
   }
 
   fn decode_member(
+    recursion_level: usize,
     codec: &super::Codec,
     mut builder: capnp::dynamic_struct::Builder<'_>,
     field: capnp::schema::Field,
@@ -664,7 +709,13 @@ fn decode_struct(
             .init(field)?
             .downcast::<capnp::dynamic_struct::Builder>();
 
-          decode_struct(codec, &mut field_value, struct_builder, field_meta)?;
+          decode_struct(
+            recursion_level + 1,
+            codec,
+            &mut field_value,
+            struct_builder,
+            field_meta,
+          )?;
         } else {
           //
           // FIXME: We should only init this struct if any field is
@@ -682,7 +733,13 @@ fn decode_struct(
             .downcast::<capnp::dynamic_struct::Builder>();
 
           // Flattened struct; pass the JsonValue at this level down
-          decode_struct(codec, value, struct_builder, field_meta)?;
+          decode_struct(
+            recursion_level + 1,
+            codec,
+            value,
+            struct_builder,
+            field_meta,
+          )?;
         }
       }
       capnp::introspect::TypeVariant::List(_element_type) => {
@@ -700,7 +757,13 @@ fn decode_struct(
           .reborrow()
           .initn(field, field_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
-        decode_list(codec, field_value, list_builder, field_meta)?;
+        decode_list(
+          recursion_level,
+          codec,
+          field_value,
+          list_builder,
+          field_meta,
+        )?;
       }
 
       capnp::introspect::TypeVariant::AnyPointer => {
@@ -733,6 +796,7 @@ fn decode_struct(
     let field_name = format!("{}{}", field_prefix, field_meta.name);
 
     decode_member(
+      recursion_level,
       codec,
       builder.reborrow(),
       field,
@@ -823,6 +887,7 @@ fn decode_struct(
         break;
       }
       decode_member(
+        recursion_level,
         codec,
         builder.reborrow(),
         field,
@@ -845,7 +910,7 @@ mod test {
     let json = r#""Hello, World!""#;
 
     let mut parser = Parser::new(json.chars());
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
 
     assert!(matches!(value, JsonValue::String(s) if s == "Hello, World!"));
     Ok(())
@@ -856,7 +921,7 @@ mod test {
     let json = r#""Hełło,\nWorld!\"†ęś†: \u0007""#;
 
     let mut parser = Parser::new(json.chars());
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
 
     assert!(
       matches!(value, JsonValue::String(s) if s == "Hełło,\nWorld!\"†ęś†: \u{0007}")
@@ -864,7 +929,7 @@ mod test {
 
     let json = r#"{"value":"tab: \t, newline: \n, carriage return: \r, quote: \", backslash: \\"}"#;
     let mut parser = Parser::new(json.chars());
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
     let JsonValue::Object(map) = value else {
       panic!("Expected object at top level");
     };

@@ -79,6 +79,15 @@
 //! - **`$Json.flatten()`** / **`$Json.flatten(prefix = "p.")`** — splice a
 //!   struct, group or union's members directly into the parent object rather
 //!   than nesting them, optionally prefixing each name.
+//!
+//!   Because a flattened field consumes no JSON nesting, flattening must
+//!   terminate: a struct cannot flatten a field of its own type, directly or
+//!   through a chain of other flattened fields and groups. [`validate_schema`]
+//!   checks this and reports it the way the C++ codec does; encoding and
+//!   decoding do not, since a schema is compile-time data and a cycle in one
+//!   is a build-time mistake rather than a property of any input. Left
+//!   unchecked, a cyclic schema is still rejected when decoded, but by the
+//!   recursion limit and with a less pointed message.
 //! - **`$Json.discriminator(name = "kind", valueName = "value")`** — encode
 //!   which member of a union is active as a sibling string field rather than
 //!   by the presence of the member's own key.
@@ -110,10 +119,6 @@
 //! The following are known divergences from the C++ codec. They matter mostly
 //! when decoding input from an untrusted or third-party producer:
 //!
-//! - There is no limit on JSON nesting depth. The parser is recursive, so
-//!   deeply nested input can exhaust the stack and abort the process. The C++
-//!   codec caps nesting at 64 levels. **Do not decode untrusted input without
-//!   bounding its nesting depth yourself.**
 //! - Input after the top-level value is ignored rather than rejected.
 //! - Numbers are range-checked only loosely: a value too large for the target
 //!   integer type is saturated rather than rejected, where C++ raises an
@@ -145,6 +150,7 @@ use std::collections::HashMap;
 mod data;
 mod decode;
 mod encode;
+mod validate;
 
 #[allow(missing_docs)]
 mod schema {
@@ -279,6 +285,54 @@ impl<'schema, 'prefix> EncodingOptions<'schema, 'prefix> {
   }
 }
 
+/// Check that a schema can be represented as JSON at all.
+///
+/// At present this means checking that `$Json.flatten` terminates. A flattened
+/// field splices its members into the parent's JSON object instead of nesting
+/// them, so a struct that flattens a field of its own type — directly, or
+/// through a chain of other flattened fields and groups — describes an object
+/// of infinite width. The C++ codec rejects such a schema outright with
+/// "cyclic JSON flattening detected"; this function is how you ask for the
+/// same verdict.
+///
+/// `T` is the generated `Owned` type of the struct you encode or decode as the
+/// root. Every struct reachable from it is checked too — including through
+/// plain fields and list element types — so validating the root type covers
+/// the whole message.
+///
+/// # When to call this
+///
+/// Once, at startup or from a test — not per message. A schema is compile-time
+/// data: `capnpc` generates it and nothing can change it at runtime, so a
+/// cyclic flatten is a mistake in your `.capnp` file rather than a property of
+/// any particular input. Encoding and decoding therefore do *not* run this
+/// check, and paying for it on every call would be a permanent tax to
+/// re-discover a build-time bug.
+///
+/// ```ignore
+/// #[test]
+/// fn schema_is_json_encodable() {
+///   capnp_json::validate_schema::<my_schema_capnp::my_struct::Owned>()
+///     .expect("schema must be JSON-encodable");
+/// }
+/// ```
+///
+/// Skipping it is not dangerous, only less informative: a cyclic schema still
+/// gets rejected when decoded, by the recursion limit
+/// ([`CodecOptions::recursion_limit`]), just with a message that points at the
+/// depth rather than at the cycle.
+pub fn validate_schema<T: capnp::traits::OwnedStruct>() -> capnp::Result<()> {
+  // `OwnedStruct` is only implemented for struct types, so the other variants
+  // are unreachable; report rather than panic if that ever stops holding.
+  let capnp::introspect::TypeVariant::Struct(raw) = T::introspect().which()
+  else {
+    return Err(capnp::Error::failed(
+      "validate_schema requires a struct type".into(),
+    ));
+  };
+  validate::check_flattening_terminates(capnp::schema::StructSchema::new(raw))
+}
+
 /// Encode a Cap'n Proto struct as a JSON string.
 ///
 /// `reader` accepts anything that converts into a
@@ -321,8 +375,7 @@ pub fn to_json<'msg>(
 ///
 /// This is [`Codec::new().decode(json, builder)`](Codec::decode). Read
 /// [the compatibility notes](crate#compatibility-notes) before decoding input
-/// you do not control — in particular, deeply nested JSON can exhaust the
-/// stack.
+/// you do not control.
 ///
 /// ```ignore
 /// capnp_json::from_json(&json, root)?;
@@ -641,6 +694,54 @@ pub fn make_field_codec<'env>(
   (encode_fn, decode_fn)
 }
 
+/// Encoding and decoding options for a [`Codec`].
+///
+/// Construct with [`Default`] and adjust what you need, so that options added
+/// in future versions keep their defaults:
+///
+/// ```
+/// use capnp_json::{Codec, CodecOptions};
+///
+/// let codec = Codec::new_with_options(CodecOptions {
+///   recursion_limit: 32,
+///   ..Default::default()
+/// });
+/// # let _ = codec;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecOptions {
+  /// How deeply decoding will recurse before giving up. Defaults to 64,
+  /// matching the C++ codec's `maxNestingDepth`.
+  ///
+  /// Decoding is recursive, so without a bound, deeply nested input exhausts
+  /// the stack and aborts the process — which is not a catchable error in
+  /// Rust. The limit turns that into an ordinary `Err`.
+  ///
+  /// It bounds two things: the nesting depth of the JSON itself, and the
+  /// depth of the walk over the schema. The second is not implied by the
+  /// first, because a struct that flattens a field of its own type recurses
+  /// on the schema without descending into the JSON at all.
+  ///
+  /// A limit of `N` admits `N` nested arrays or objects. Scalars do not count
+  /// against it, so the boundary is the same one the C++ codec applies at the
+  /// same numeric setting.
+  ///
+  /// **Raising this reintroduces the crash it exists to prevent.** The safe
+  /// ceiling depends on your build profile and the stack size of the thread
+  /// doing the decoding; measured on a 1 MiB stack, decoding survived depth
+  /// 1600 in release but overflowed at depth 200 in debug. The default is
+  /// comfortably safe in both. Lowering it is always safe.
+  pub recursion_limit: usize,
+}
+
+impl Default for CodecOptions {
+  fn default() -> Self {
+    Self {
+      recursion_limit: 64,
+    }
+  }
+}
+
 /// A JSON codec for Cap'n Proto messages.
 ///
 /// A `Codec` holds the custom [`FieldCodec`]s to apply while encoding and
@@ -667,12 +768,18 @@ pub fn make_field_codec<'env>(
 /// # let _ = codec;
 /// ```
 ///
-/// Once built, a `Codec` is immutable and encoding/decoding take `&self`, so
-/// it is cheap to reuse across many messages and safe to share between
-/// threads as long as the codecs it holds are.
-///
 /// The `'env` lifetime is that of the data borrowed by the registered codecs;
 /// for codecs that own everything they use, it is `'static`.
+///
+/// # Reuse and threads
+///
+/// Encoding and decoding take `&self` and keep no state between calls, so one
+/// `Codec` serves any number of messages and building one is cheap. Reuse it
+/// if it is convenient; nothing is lost by not doing so.
+///
+/// A `Codec` is neither `Send` nor `Sync`, because the [`FieldCodec`]s it
+/// holds are trait objects carrying no thread-safety bound. Give each thread
+/// its own.
 ///
 /// # Which codec wins
 ///
@@ -708,6 +815,8 @@ pub struct Codec<'env> {
   field_overrides: HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
   type_overrides:  HashMap<capnp::introspect::Type, Box<dyn FieldCodec + 'env>>,
   registry:        HashMap<String, Box<dyn FieldCodec + 'env>>,
+
+  options: CodecOptions,
 }
 
 impl<'env> Codec<'env> {
@@ -716,10 +825,20 @@ impl<'env> Codec<'env> {
   /// The result encodes and decodes exactly as [`to_json`] and [`from_json`]
   /// do.
   pub fn new() -> Self {
+    Self::new_with_options(CodecOptions::default())
+  }
+
+  /// Create a codec with no custom [`FieldCodec`]s registered, and the given
+  /// [`CodecOptions`].
+  ///
+  /// Equivalent to [`new`](Codec::new) other than the options; read
+  /// [`CodecOptions::recursion_limit`] before raising the recursion limit.
+  pub fn new_with_options(options: CodecOptions) -> Self {
     Self {
       field_overrides: HashMap::new(),
-      type_overrides:  HashMap::new(),
-      registry:        HashMap::new(),
+      type_overrides: HashMap::new(),
+      registry: HashMap::new(),
+      options,
     }
   }
 
