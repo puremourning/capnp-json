@@ -23,7 +23,7 @@ impl From<ParseError> for capnp::Error {
   }
 }
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::JsonValue;
 
@@ -167,7 +167,7 @@ where
       Some('{') => {
         check_container_depth()?;
         self.advance()?;
-        let mut members = HashMap::new();
+        let mut members = BTreeMap::new();
         let mut require_comma = false;
         while self.peek_next().is_some_and(|c| c != '}') {
           if require_comma {
@@ -358,7 +358,7 @@ pub(crate) fn parse(
     ));
   }
   let meta = EncodingOptions::default();
-  decode_struct(0, codec, &mut value, builder, &meta)
+  decode_struct(0, codec, &mut value, &mut Direct(builder), &meta)
 }
 
 /// Whether a JSON `null` here means "this field is absent".
@@ -719,6 +719,84 @@ fn decode_primitive<'json, 'meta>(
   }
 }
 
+/// Where a decoded struct's fields get written.
+///
+/// A flattened struct shares its parent's JSON object rather than occupying a
+/// key of its own, so whether it is present at all is not known until one of
+/// its members turns up. Writing through a sink defers creating it until that
+/// happens: a flattened field the JSON never mentions is never touched, and
+/// writing into a nested one creates its parents in turn.
+trait StructSink {
+  /// The schema being decoded into. Answering this must not create anything,
+  /// since it is needed before we know whether there is anything to write.
+  fn schema(&self) -> capnp::schema::StructSchema;
+
+  /// The builder to write into, creating the struct if this is the first
+  /// write. Only call this once you know a field is actually being written —
+  /// calling it to "get the builder" up front reintroduces the eager
+  /// creation this exists to avoid.
+  fn builder(&mut self) -> capnp::Result<capnp::dynamic_struct::Builder<'_>>;
+}
+
+/// A struct that already exists: the message root, a non-flattened field the
+/// JSON named, or a list element.
+struct Direct<'a>(capnp::dynamic_struct::Builder<'a>);
+
+impl StructSink for Direct<'_> {
+  fn schema(&self) -> capnp::schema::StructSchema {
+    self.0.get_schema()
+  }
+
+  fn builder(&mut self) -> capnp::Result<capnp::dynamic_struct::Builder<'_>> {
+    Ok(self.0.reborrow())
+  }
+}
+
+/// A flattened field, created on first write.
+struct Flattened<'p> {
+  parent:  &'p mut dyn StructSink,
+  field:   capnp::schema::Field,
+  schema:  capnp::schema::StructSchema,
+  created: bool,
+}
+
+impl StructSink for Flattened<'_> {
+  fn schema(&self) -> capnp::schema::StructSchema {
+    self.schema
+  }
+
+  fn builder(&mut self) -> capnp::Result<capnp::dynamic_struct::Builder<'_>> {
+    let first = !self.created;
+    self.created = true;
+
+    // Deriving the child from the parent again on every write, rather than
+    // caching it, is deliberate: `parent.builder()` borrows from `&mut self`,
+    // so the result cannot be stored for `'a`. It is cheap — after the first
+    // call the pointer is non-null, so `get` is just pointer arithmetic.
+    let parent = self.parent.builder()?;
+
+    // `get` merges: for a group it reinterprets the parent's own builder, and
+    // for a struct field it allocates only while the pointer is still null.
+    // `init` would instead discard whatever is already there, and for a group
+    // would clear it.
+    //
+    // Union members are the exception. `get` does not set the discriminant,
+    // so the member has to be activated once with `init`; doing that on every
+    // write would clear the fields written before it.
+    let value = if first && is_union_member(self.field) {
+      parent.init(self.field)?
+    } else {
+      parent.get(self.field)?
+    };
+    Ok(value.downcast::<capnp::dynamic_struct::Builder>())
+  }
+}
+
+fn is_union_member(field: capnp::schema::Field) -> bool {
+  field.get_proto().get_discriminant_value()
+    != capnp::schema_capnp::field::NO_DISCRIMINANT
+}
+
 fn decode_list(
   recursion_level: usize,
   codec: &super::Codec,
@@ -737,7 +815,7 @@ fn decode_list(
           recursion_level + 1,
           codec,
           &mut item_value,
-          struct_builder,
+          &mut Direct(struct_builder),
           field_meta,
         )?;
       }
@@ -785,7 +863,7 @@ fn decode_struct(
   recursion_level: usize,
   codec: &super::Codec,
   value: &mut JsonValue,
-  mut builder: capnp::dynamic_struct::Builder<'_>,
+  sink: &mut dyn StructSink,
   meta: &EncodingOptions,
 ) -> capnp::Result<()> {
   if recursion_level > codec.options.recursion_limit {
@@ -804,8 +882,8 @@ fn decode_struct(
     std::borrow::Cow::Borrowed("")
   };
 
-  if let Some(field_codec) = builder
-    .get_schema()
+  if let Some(field_codec) = sink
+    .schema()
     .get_annotations()?
     .iter()
     .find(|a| a.get_id() == rust_json_capnp::codec::ID)
@@ -815,14 +893,14 @@ fn decode_struct(
       .downcast::<capnp::text::Reader>()
       .to_str()?;
     if let Some(field_codec) = codec.registry.get(field_codec) {
-      return field_codec.decode_value(value, builder.reborrow().into());
+      return field_codec.decode_value(value, sink.builder()?.into());
     }
   }
 
   fn decode_member(
     recursion_level: usize,
     codec: &super::Codec,
-    mut builder: capnp::dynamic_struct::Builder<'_>,
+    sink: &mut dyn StructSink,
     field: capnp::schema::Field,
     field_meta: &EncodingOptions,
     value: &mut JsonValue,
@@ -850,15 +928,11 @@ fn decode_struct(
         Some(v) => v,
         None => return Ok(()),
       };
-      return field_codec.decode_member(
-        &field_value,
-        builder.reborrow(),
-        field,
-      );
+      return field_codec.decode_member(&field_value, sink.builder()?, field);
     }
 
     match field.get_type().which() {
-      capnp::introspect::TypeVariant::Struct(_struct_schema) => {
+      capnp::introspect::TypeVariant::Struct(struct_schema) => {
         if field_meta.flatten.is_none() {
           let mut field_value = match obj.remove(value_name) {
             Some(v) => v,
@@ -868,8 +942,11 @@ fn decode_struct(
             return Ok(());
           }
 
-          let struct_builder = builder
-            .reborrow()
+          // The JSON named this field, so creating it is right. `init`
+          // replaces rather than merges, matching what C++ does for a field
+          // that is present.
+          let struct_builder = sink
+            .builder()?
             .init(field)?
             .downcast::<capnp::dynamic_struct::Builder>();
 
@@ -877,31 +954,32 @@ fn decode_struct(
             recursion_level + 1,
             codec,
             &mut field_value,
-            struct_builder,
+            &mut Direct(struct_builder),
             field_meta,
           )?;
         } else {
-          //
-          // FIXME: We should only init this struct if any field is
-          // found in decode_struct. For now, we always init it.
-          // To do that we would need to get decode_struct to actually
-          // take the builder+field, or a callback to init it.
-          //
-          // The current implementation results in has_<field>()
-          // returning true even if all fields are missing in the
-          // JSON.
-          //
-          let struct_builder = builder
-            .reborrow()
-            .init(field)?
-            .downcast::<capnp::dynamic_struct::Builder>();
-
+          // A flattened struct has no key of its own, so nothing is created
+          // here; the sink does it if and when a member is actually written.
+          let mut flattened = Flattened {
+            parent: sink,
+            field,
+            schema: capnp::schema::StructSchema::new(struct_schema),
+            created: false,
+          };
+          if is_union_member(field) {
+            // Except when it is a union member. Reaching here means the
+            // variant was already chosen, possibly by a discriminator tag
+            // alone, and choosing it has to activate it whether or not any of
+            // its own members appear. C++ does the same, activating with
+            // `clear()` before decoding into it.
+            flattened.builder()?;
+          }
           // Flattened struct; pass the JsonValue at this level down
           decode_struct(
             recursion_level + 1,
             codec,
             value,
-            struct_builder,
+            &mut flattened,
             field_meta,
           )?;
         }
@@ -920,8 +998,8 @@ fn decode_struct(
             field_meta.name
           )));
         };
-        let list_builder = builder
-          .reborrow()
+        let list_builder = sink
+          .builder()?
           .initn(field, field_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
         decode_list(
@@ -956,23 +1034,22 @@ fn decode_struct(
           return Ok(());
         }
 
-        builder.set(
-          field,
-          decode_primitive(&mut field_value, &field.get_type(), field_meta)?,
-        )?;
+        let value =
+          decode_primitive(&mut field_value, &field.get_type(), field_meta)?;
+        sink.builder()?.set(field, value)?;
       }
     }
     Ok(())
   }
 
-  for field in builder.get_schema().get_non_union_fields()? {
+  for field in sink.schema().get_non_union_fields()? {
     let field_meta = EncodingOptions::from_field(&field_prefix, field)?;
     let field_name = format!("{}{}", field_prefix, field_meta.name);
 
     decode_member(
       recursion_level,
       codec,
-      builder.reborrow(),
+      sink,
       field,
       &field_meta,
       value,
@@ -986,8 +1063,8 @@ fn decode_struct(
     ));
   };
 
-  let struct_discriminator = builder
-    .get_schema()
+  let struct_discriminator = sink
+    .schema()
     .get_annotations()?
     .iter()
     .find(|a| a.get_id() == json_capnp::discriminator::ID)
@@ -1023,7 +1100,7 @@ fn decode_struct(
     None => {
       // find the first field that exists matching a union field?
       let mut discriminant = None;
-      for field in builder.get_schema().get_union_fields()? {
+      for field in sink.schema().get_union_fields()? {
         let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
         let field_name = format!("{}{}", field_prefix, field_meta.name);
         if obj.contains_key(&field_name) {
@@ -1036,7 +1113,7 @@ fn decode_struct(
   };
 
   if let Some(discriminant) = discriminant {
-    for field in builder.get_schema().get_union_fields()? {
+    for field in sink.schema().get_union_fields()? {
       let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
       if field_meta.name != discriminant {
         continue;
@@ -1055,15 +1132,15 @@ fn decode_struct(
         capnp::introspect::TypeVariant::Void
       ) {
         // Void union member; just set the discriminant
-        builder
-          .reborrow()
+        sink
+          .builder()?
           .set(field, capnp::dynamic_value::Reader::Void)?;
         break;
       }
       decode_member(
         recursion_level,
         codec,
-        builder.reborrow(),
+        sink,
         field,
         &field_meta,
         value,

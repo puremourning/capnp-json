@@ -167,7 +167,7 @@
 
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 mod data;
 mod decode;
@@ -436,13 +436,16 @@ pub fn from_json<'segments>(
 ///
 /// # Object ordering
 ///
-/// [`Object`](JsonValue::Object) is a [`HashMap`], so it neither preserves
-/// insertion order nor sorts its keys, and the order in which a custom
-/// codec's object members are written will differ from run to run. Consumers
-/// that compare encoded output byte-for-byte (golden-file tests, signatures)
-/// should not use object-valued custom codecs, or should sort the output
-/// themselves. Members of *schema* structs are unaffected: those are written
-/// in schema declaration order.
+/// [`Object`](JsonValue::Object) is a [`BTreeMap`], so its members are written
+/// in sorted key order. JSON objects are unordered by definition, so no order
+/// is more correct than another, but a *deterministic* one matters: the same
+/// value must encode to the same bytes every time, or golden-file tests,
+/// response caching and anything signing the output stop working. Sorted order
+/// is also the canonical form specified by RFC 8785.
+///
+/// Members of *schema* structs never pass through this map — they are written
+/// in schema declaration order — so this affects only the objects a custom
+/// [`FieldCodec`] builds.
 ///
 /// Duplicate keys are rejected when parsing, so an `Object` decoded by this
 /// crate never loses a member.
@@ -462,7 +465,7 @@ pub enum JsonValue {
   /// A JSON array.
   Array(Vec<JsonValue>),
   /// A JSON object. See [the note on ordering](JsonValue#object-ordering).
-  Object(HashMap<String, JsonValue>),
+  Object(BTreeMap<String, JsonValue>),
 
   /// Internal scratch space used while decoding `Data` fields; not part of
   /// the JSON data model.
@@ -805,9 +808,21 @@ impl Default for CodecOptions {
 /// `Codec` serves any number of messages and building one is cheap. Reuse it
 /// if it is convenient; nothing is lost by not doing so.
 ///
-/// A `Codec` is neither `Send` nor `Sync`, because the [`FieldCodec`]s it
-/// holds are trait objects carrying no thread-safety bound. Give each thread
-/// its own.
+/// A `Codec` is neither `Send` nor `Sync`, so give each thread its own. In
+/// async code that means building one where it is used rather than holding it
+/// in shared state: `Codec::new()` costs a handful of nanoseconds, so the only
+/// reason to keep one alive is the custom [`FieldCodec`]s registered on it. If
+/// you need those in shared state, store something `Send + Sync` that builds
+/// the codec — a factory closure — and call it per request, or keep one in a
+/// [`thread_local!`](std::thread_local).
+///
+/// This is not a bound that could simply be added. It comes from the schema
+/// types: `field_overrides` is keyed on [`capnp::schema::Field`], which holds
+/// readers over the generated schema data, and those hold raw pointers. The
+/// same is true of [`capnp::dynamic_value::Reader`] and its `Builder`, so the
+/// *values* being encoded are `!Send` too — an encode or decode is inherently
+/// one synchronous stretch, and a `Send` `Codec` would only ever buy the
+/// ability to store one, never to await part-way through.
 ///
 /// # Which codec wins
 ///

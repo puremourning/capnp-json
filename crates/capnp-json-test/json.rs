@@ -19,11 +19,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#[cfg(test)]
+// Not `#[cfg(test)]`: the benchmarks in `benches/` are a separate compilation
+// unit and need the generated types too.
 capnp::generated_code!(pub mod test_capnp);
-#[cfg(test)]
 capnp::generated_code!(pub mod json_test_capnp);
-#[cfg(test)]
 capnp::generated_code!(pub mod test_compat_capnp);
 
 mod cppcompat;
@@ -1104,7 +1103,7 @@ mod tests {
         "TestCodec",
         json::make_field_codec(
           |_value| {
-            let mut v = std::collections::HashMap::new();
+            let mut v = std::collections::BTreeMap::new();
             v.insert("test".to_string(), JsonValue::String("Inside".into()));
             Ok(JsonValue::Object(v))
           },
@@ -1214,7 +1213,7 @@ mod tests {
         "TestCodec",
         json::make_field_codec(
           |_value| {
-            let mut v = std::collections::HashMap::new();
+            let mut v = std::collections::BTreeMap::new();
             v.insert("test".to_string(), JsonValue::String("Inside".into()));
             Ok(JsonValue::Object(v))
           },
@@ -1324,7 +1323,7 @@ mod tests {
       a_group_field.get_type(),
       json::make_field_codec(
         |_reader| {
-          let v = std::collections::HashMap::from([(
+          let v = std::collections::BTreeMap::from([(
             "aGroup".to_string(),
             JsonValue::String("Overridden".into()),
           )]);
@@ -1366,7 +1365,7 @@ mod tests {
       a_group_field.get_type(),
       json::make_field_codec(
         |_reader| {
-          let v = std::collections::HashMap::from([(
+          let v = std::collections::BTreeMap::from([(
             "aGroup".to_string(),
             JsonValue::String("Overridden".into()),
           )]);
@@ -1640,16 +1639,14 @@ mod tests {
     assert_eq!(r.get_b()?.get_other(), 4);
     assert_eq!(r.get_b()?.get_a()?.get_value(), 3);
 
-    // Re-encoding does not reproduce the input byte-for-byte: decoding always
-    // initialises a flattened struct field, even when no member of it was
-    // present, so the inner `a`'s own flattened `b` now exists and its
-    // members appear on the way back out. That is the pre-existing
-    // `decode_struct` FIXME, not an effect of the cycle check -- recorded
-    // here so the day it is fixed this test says so.
+    // Re-encoding reproduces the input byte-for-byte. It did not always: a
+    // flattened field used to be created whether or not the JSON named it, so
+    // the inner `a`'s own flattened `b` sprang into existence during the
+    // decode and its members reappeared on the way out.
     assert_eq!(
       json::to_json(rt_root.reborrow_as_reader())?,
-      r#"{"a":{"other":0,"value":3},"other":4,"value":9}"#,
-      "flattened struct fields are still eagerly initialised on decode"
+      encoded,
+      "a flattened field the JSON never mentioned must not be created"
     );
     Ok(())
   }
@@ -2305,6 +2302,170 @@ mod tests {
       panic!("expected trailing data to be rejected");
     };
     assert_eq!(e.extra, "Trailing characters after JSON value");
+    Ok(())
+  }
+
+  // -------------------------------------------------------------------
+  // Flattened fields are created only when the JSON names one of their
+  // members. A flattened struct shares its parent's object rather than
+  // occupying a key, so there is no key whose absence would otherwise say
+  // "not present"; the decoder has to defer creating it until a member
+  // actually turns up.
+  // -------------------------------------------------------------------
+
+  /// Nothing in the JSON refers to the flattened struct, so it must not exist
+  /// afterwards.
+  #[test]
+  fn flattened_field_absent_is_not_created() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    for json in [r#"{}"#, r#"{"top":7}"#] {
+      let mut builder = message::Builder::new_default();
+      let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+      json::from_json(json, root.reborrow())?;
+
+      let r = root.reborrow_as_reader();
+      assert!(
+        !r.has_outer(),
+        "{json} must not create the flattened struct"
+      );
+      // ... so none of its members come back out on a re-encode. `top` is a
+      // primitive, so it is always present; only the flattened members are in
+      // question here.
+      let reencoded = json::to_json(r)?;
+      assert!(
+        !reencoded.contains("\"a\"") && !reencoded.contains("in."),
+        "{json} re-encoded as {reencoded}"
+      );
+    }
+    Ok(())
+  }
+
+  /// Naming one member creates the struct, and only as far down as needed.
+  #[test]
+  fn flattened_field_is_created_when_named() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    json::from_json(r#"{"a":"x"}"#, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert!(r.has_outer());
+    assert_eq!(r.get_outer()?.get_a()?.to_str()?, "x");
+    assert!(
+      !r.get_outer()?.has_inner(),
+      "the nested flattened struct was not named and must not exist"
+    );
+    Ok(())
+  }
+
+  /// Naming only the innermost member creates the whole chain, and matches on
+  /// the prefix rather than the bare name.
+  #[test]
+  fn nested_flattened_field_creates_its_parents() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    json::from_json(r#"{"in.b":"y"}"#, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert!(r.has_outer(), "the intermediate struct must be created");
+    assert!(r.get_outer()?.has_inner());
+    assert_eq!(r.get_outer()?.get_inner()?.get_b()?.to_str()?, "y");
+    assert!(!r.get_outer()?.has_a(), "sibling must stay at its default");
+
+    // The prefix is required: `b` on its own is an unknown field, ignored.
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    json::from_json(r#"{"b":"y"}"#, root.reborrow())?;
+    assert!(
+      !root.reborrow_as_reader().has_outer(),
+      "an unprefixed name must not match a prefixed flattened member"
+    );
+    Ok(())
+  }
+
+  /// Decoding merges into the builder, so a flattened field the JSON does not
+  /// mention must survive untouched. It used to be wiped: creating it went
+  /// through `init`, which replaces a struct field and clears a group.
+  #[test]
+  fn decoding_does_not_wipe_an_existing_flattened_field() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    root.reborrow().init_outer().set_a("keep me");
+
+    json::from_json(r#"{"top":3}"#, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert_eq!(r.get_top(), 3);
+    assert_eq!(
+      r.get_outer()?.get_a()?.to_str()?,
+      "keep me",
+      "a flattened field the JSON did not mention must not be cleared"
+    );
+    Ok(())
+  }
+
+  /// The same, for a flattened *group*. `init` on a group clears it, so this
+  /// was destructive in a way `has_*` could not reveal.
+  #[test]
+  fn decoding_does_not_clear_an_existing_flattened_group() -> capnp::Result<()>
+  {
+    use crate::json_test_capnp::test_json_annotations;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<test_json_annotations::Builder<'_>>();
+    root.reborrow().init_a_group().set_flat_foo(0xF00);
+
+    json::from_json(
+      r#"{"names-can_contain!anything Really":"x"}"#,
+      root.reborrow(),
+    )?;
+
+    assert_eq!(
+      root.reborrow_as_reader().get_a_group().get_flat_foo(),
+      0xF00,
+      "a flattened group the JSON did not mention must not be cleared"
+    );
+    Ok(())
+  }
+
+  /// A flattened struct that is a union member still gets activated by its
+  /// discriminator tag alone, with none of its own members present.
+  #[test]
+  fn flattened_union_member_is_activated_by_its_tag() -> capnp::Result<()> {
+    use crate::json_test_capnp::{
+      test_flattened_struct,
+      test_json_annotations3,
+    };
+
+    // Tag plus a member.
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<test_json_annotations3::Builder<'_>>();
+    json::from_json(r#"{"type":"bar","value":"v"}"#, root.reborrow())?;
+    match root.reborrow_as_reader().which()? {
+      test_json_annotations3::Bar(bar) => {
+        assert_eq!(bar?.get_value()?.to_str()?, "v")
+      }
+      test_json_annotations3::Foo(_) => panic!("expected bar"),
+    }
+
+    // Tag alone: the variant must still be selected.
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<test_json_annotations3::Builder<'_>>();
+    json::from_json(r#"{"type":"bar"}"#, root.reborrow())?;
+    match root.reborrow_as_reader().which()? {
+      test_json_annotations3::Bar(bar) => {
+        let _: test_flattened_struct::Reader<'_> = bar?;
+      }
+      test_json_annotations3::Foo(_) => {
+        panic!("the discriminator tag alone must select the variant")
+      }
+    }
     Ok(())
   }
 }

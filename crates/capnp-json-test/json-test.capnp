@@ -241,3 +241,20 @@ struct ReferencesCyclic {
 struct ReferencesCyclicViaList {
   x @0 :List(CyclicFlatten);
 }
+
+struct FlattenLazy {
+  # A flattened struct field whose members can all be absent, so that decoding
+  # can be checked not to create it. `inner` is nested and prefixed, to check
+  # the same holds one level down.
+  outer @0 :FlattenLazyOuter $Json.flatten();
+  top @1 :UInt16;
+}
+
+struct FlattenLazyOuter {
+  a @0 :Text;
+  inner @1 :FlattenLazyInner $Json.flatten(prefix="in.");
+}
+
+struct FlattenLazyInner {
+  b @0 :Text;
+}
