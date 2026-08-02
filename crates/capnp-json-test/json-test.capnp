@@ -22,6 +22,7 @@
 @0xc9d405cf4333e4c9;
 
 using Json = import "/capnp/compat/json.capnp";
+using RustJson = import "/rust-json.capnp";
 
 $import "/capnp/c++.capnp".namespace("capnp");
 
@@ -39,18 +40,18 @@ struct TestJsonAnnotations {
     }
   }
 
-  prefixedGroup :group $Json.flatten(prefix = "pfx.") {
+  prefixedGroup :group $Json.flatten(prefix="pfx.") {
     foo @5 :Text;
     bar @6 :UInt32 $Json.name("renamed-bar");
     baz :group {
       hello @7 :Bool;
     }
-    morePrefix :group $Json.flatten(prefix = "xfp.") {
+    morePrefix :group $Json.flatten(prefix="xfp.") {
       qux @8 :Text;
     }
   }
 
-  aUnion :union $Json.flatten() $Json.discriminator(name = "union-type") {
+  aUnion :union $Json.flatten() $Json.discriminator(name="union-type") {
     foo :group $Json.flatten() {
       fooMember @9 :Text;
       multiMember @10 :UInt32;
@@ -78,14 +79,14 @@ struct TestJsonAnnotations {
   testBase64 @18 :Data $Json.base64;
   testHex @19 :Data $Json.hex;
 
-  bUnion :union $Json.flatten() $Json.discriminator(valueName = "bValue") {
+  bUnion :union $Json.flatten() $Json.discriminator(valueName="bValue") {
     foo @20 :Text;
     bar @21 :UInt32 $Json.name("renamed-bar");
   }
 
   externalUnion @22 :TestJsonAnnotations3;
 
-  unionWithVoid :union $Json.discriminator(name = "type") {
+  unionWithVoid :union $Json.discriminator(name="type") {
     intValue @23 :UInt32;
     voidValue @24 :Void;
     textValue @25 :Text;
@@ -97,7 +98,7 @@ struct TestJsonAnnotations2 {
   cycle @1 :TestJsonAnnotations;
 }
 
-struct TestJsonAnnotations3 $Json.discriminator(name = "type") {
+struct TestJsonAnnotations3 $Json.discriminator(name="type") {
   union {
     foo @0 :UInt32;
     bar @1 :TestFlattenedStruct $Json.flatten();
@@ -130,29 +131,49 @@ struct TestRenamedAnonUnion {
 }
 
 struct NestedHex {
-  dataAllTheWayDown @0 : List(List(Data)) $Json.hex;
+  dataAllTheWayDown @0 :List(List(Data)) $Json.hex;
 }
 
 struct UnnamedDiscriminator {
-  baz: union $Json.discriminator() {
+  baz :union $Json.discriminator() {
     foo @0 :Text;
     bar @1 :UInt32;
   }
 
-  sbaz: union $Json.discriminator() $Json.flatten() {
+  sbaz :union $Json.discriminator() $Json.flatten() {
     sfoo @2 :Text;
     sbar @3 :UInt32;
   }
 }
 
 struct NamedDiscriminator {
-  baz: union $Json.discriminator(name="baz_kind") {
+  baz :union $Json.discriminator(name="baz_kind") {
     foo @0 :Text;
     bar @1 :UInt32;
   }
 
-  sbaz: union $Json.discriminator(name="sbaz_kind") $Json.flatten() {
+  sbaz :union $Json.discriminator(name="sbaz_kind") $Json.flatten() {
     sfoo @2 :Text;
     sbar @3 :UInt32;
   }
+}
+
+struct TestAnyPointer {
+  anyPointerField @0 :AnyPointer;
+}
+
+struct TestGeneric(T) {
+  anyPointerField @0 :AnyPointer;
+  genericField @1 :T;
+}
+
+struct TestCustomCodec $RustJson.codec("TestCodec") {
+  something @0 :AnyPointer;
+  # No codec is registered for this AnyPointer so it should fail, but 'TestCodec' being registered
+  # overrides the entire struct codec
+}
+
+struct StructWithCustomCodec {
+  structLevel @0 :TestCustomCodec;
+  fieldLevel @1 :Text $RustJson.codec("TestFieldCodec");
 }

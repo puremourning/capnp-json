@@ -1,24 +1,105 @@
 use super::data::{base64, hex};
-use super::{json_capnp, DataEncoding, EncodingOptions};
+use super::{
+  json_capnp,
+  rust_json_capnp,
+  DataEncoding,
+  EncodingOptions,
+  JsonValue,
+};
 
 pub fn serialize_json_to<'reader, W>(
+  codec: &super::Codec,
   writer: &mut W,
   reader: impl Into<capnp::dynamic_value::Reader<'reader>>,
 ) -> capnp::Result<()>
 where
   W: std::io::Write,
 {
-  let meta = EncodingOptions {
-    prefix:        &std::borrow::Cow::Borrowed(""),
-    name:          "",
-    flatten:       None,
-    discriminator: None,
-    data_encoding: DataEncoding::Default,
+  let meta = EncodingOptions::default();
+  serialize_value_to(codec, writer, reader.into(), &meta, &mut true)
+}
+
+fn write_json_value<W: std::io::Write>(
+  writer: &mut W,
+  value: &JsonValue,
+  meta: &EncodingOptions<'_, '_>,
+  first: &mut bool,
+) -> capnp::Result<()> {
+  let (flatten, field_prefix) = if let Some(flatten_options) = &meta.flatten {
+    (
+      true,
+      std::borrow::Cow::Owned(format!(
+        "{}{}",
+        meta.prefix,
+        flatten_options.get_prefix()?.to_str()?
+      )),
+    )
+  } else {
+    (false, std::borrow::Cow::Borrowed(""))
   };
-  serialize_value_to(writer, reader.into(), &meta, &mut true)
+
+  if flatten && !matches!(value, JsonValue::Object(_)) {
+    return Err(capnp::Error::failed(format!(
+      "Canot encode {}: Flattening is only supported for objects, found {:?}",
+      meta.name, value
+    )));
+  }
+
+  match value {
+    JsonValue::Null => write!(writer, "null").map_err(|e| e.into()),
+    JsonValue::Boolean(v) => {
+      if *v {
+        write!(writer, "true").map_err(|e| e.into())
+      } else {
+        write!(writer, "false").map_err(|e| e.into())
+      }
+    }
+    JsonValue::Number(v) => write_number(writer, *v),
+    JsonValue::String(v) => write_string(writer, v.as_str()),
+    JsonValue::Array(json_values) => {
+      write!(writer, "[")?;
+      let mut first = true;
+      for item in json_values {
+        if !first {
+          write!(writer, ",")?;
+        }
+        first = false;
+        write_json_value(writer, item, &EncodingOptions::default(), &mut true)?;
+      }
+      write!(writer, "]")?;
+      Ok(())
+    }
+    JsonValue::Object(hash_map) => {
+      let mut my_first = true;
+      let first = if !flatten {
+        write!(writer, "{{")?;
+        &mut my_first
+      } else {
+        first
+      };
+      for (key, value) in hash_map {
+        if !*first {
+          write!(writer, ",")?;
+        }
+        *first = false;
+        let field_name = format!("{field_prefix}{key}");
+        write_string(writer, field_name.as_str())?;
+        write!(writer, ":")?;
+        write_json_value(writer, value, &EncodingOptions::default(), first)?;
+      }
+      if !flatten {
+        write!(writer, "}}")?;
+      }
+      Ok(())
+    }
+    JsonValue::DataBuffer(_items) => Err(capnp::Error::unimplemented(
+      "DataBuffer is not a valid encoding target".into(),
+    )),
+  }
 }
 
 fn serialize_value_to<W>(
+  codec: &super::Codec,
   writer: &mut W,
   reader: capnp::dynamic_value::Reader<'_>,
   meta: &EncodingOptions<'_, '_>,
@@ -27,68 +108,109 @@ fn serialize_value_to<W>(
 where
   W: std::io::Write,
 {
-  match reader {
-    capnp::dynamic_value::Reader::Void => {
-      write!(writer, "null").map_err(|e| e.into())
-    }
-    capnp::dynamic_value::Reader::Bool(value) => if value {
-      write!(writer, "true")
-    } else {
-      write!(writer, "false")
-    }
-    .map_err(|e| e.into()),
-    capnp::dynamic_value::Reader::Int8(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::Int16(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::Int32(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::Int64(value) => {
-      write_string(writer, format!("{value}").as_str())
-    }
-    capnp::dynamic_value::Reader::UInt8(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::UInt16(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::UInt32(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::UInt64(value) => {
-      write_string(writer, format!("{value}").as_str())
-    }
-    capnp::dynamic_value::Reader::Float32(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::Float64(value) => write_number(writer, value),
-    capnp::dynamic_value::Reader::Enum(value) => {
-      if let Some(enumerant) = value.get_enumerant()? {
-        let value = enumerant
+  if let Some(field_codec) =
+    meta.codec.and_then(|c| codec.registry.get(c)).or_else(|| {
+      meta.field.and_then(|f| {
+        codec
+          .field_overrides
+          .get(&f)
+          .or_else(|| codec.type_overrides.get(&f.get_type()))
+      })
+    })
+  {
+    write_json_value(writer, &field_codec.encode_value(reader)?, meta, first)
+  } else {
+    match reader {
+      capnp::dynamic_value::Reader::Void => {
+        write!(writer, "null").map_err(|e| e.into())
+      }
+      capnp::dynamic_value::Reader::Bool(value) => if value {
+        write!(writer, "true")
+      } else {
+        write!(writer, "false")
+      }
+      .map_err(|e| e.into()),
+      capnp::dynamic_value::Reader::Int8(value) => write_number(writer, value),
+      capnp::dynamic_value::Reader::Int16(value) => write_number(writer, value),
+      capnp::dynamic_value::Reader::Int32(value) => write_number(writer, value),
+      capnp::dynamic_value::Reader::Int64(value) => {
+        write_string(writer, format!("{value}").as_str())
+      }
+      capnp::dynamic_value::Reader::UInt8(value) => write_number(writer, value),
+      capnp::dynamic_value::Reader::UInt16(value) => {
+        write_number(writer, value)
+      }
+      capnp::dynamic_value::Reader::UInt32(value) => {
+        write_number(writer, value)
+      }
+      capnp::dynamic_value::Reader::UInt64(value) => {
+        write_string(writer, format!("{value}").as_str())
+      }
+      capnp::dynamic_value::Reader::Float32(value) => {
+        write_number(writer, value)
+      }
+      capnp::dynamic_value::Reader::Float64(value) => {
+        write_number(writer, value)
+      }
+      capnp::dynamic_value::Reader::Enum(value) => {
+        if let Some(enumerant) = value.get_enumerant()? {
+          let value = enumerant
+            .get_annotations()?
+            .iter()
+            .find(|a| a.get_id() == json_capnp::name::ID)
+            .and_then(|a| {
+              a.get_value()
+                .ok()
+                .map(|v| v.downcast::<capnp::text::Reader>().to_str())
+            })
+            .unwrap_or(enumerant.get_proto().get_name()?.to_str());
+          write_string(writer, value?)
+        } else {
+          write_number(writer, value.get_value())
+        }
+      }
+      capnp::dynamic_value::Reader::Text(reader) => {
+        write_string(writer, reader.to_str()?)
+      }
+      capnp::dynamic_value::Reader::Data(data) => {
+        write_data(writer, data, meta.data_encoding)
+      }
+      capnp::dynamic_value::Reader::Struct(reader) => {
+        if let Some(field_codec) = reader
+          .get_schema()
           .get_annotations()?
           .iter()
-          .find(|a| a.get_id() == json_capnp::name::ID)
-          .and_then(|a| {
-            a.get_value()
-              .ok()
-              .map(|v| v.downcast::<capnp::text::Reader>().to_str())
-          })
-          .unwrap_or(enumerant.get_proto().get_name()?.to_str());
-        write_string(writer, value?)
-      } else {
-        write_number(writer, value.get_value())
+          .find(|a| a.get_id() == rust_json_capnp::codec::ID)
+        {
+          let field_codec = field_codec
+            .get_value()?
+            .downcast::<capnp::text::Reader<'_>>()
+            .to_str()?;
+          if let Some(field_codec) = codec.registry.get(field_codec) {
+            return write_json_value(
+              writer,
+              &field_codec.encode_value(reader.into())?,
+              meta,
+              first,
+            );
+          }
+        }
+
+        write_object(codec, writer, reader, meta, first)
       }
-    }
-    capnp::dynamic_value::Reader::Text(reader) => {
-      write_string(writer, reader.to_str()?)
-    }
-    capnp::dynamic_value::Reader::Data(data) => {
-      write_data(writer, data, meta.data_encoding)
-    }
-    capnp::dynamic_value::Reader::Struct(reader) => {
-      write_object(writer, reader, meta, first)
-    }
-    capnp::dynamic_value::Reader::List(reader) => {
-      write_array(writer, reader.iter(), meta)
-    }
-    capnp::dynamic_value::Reader::AnyPointer(_) => {
-      Err(capnp::Error::unimplemented(
-        "AnyPointer cannot be represented in JSON".into(),
-      ))
-    }
-    capnp::dynamic_value::Reader::Capability(_) => {
-      Err(capnp::Error::unimplemented(
-        "Capability cannot be represented in JSON".into(),
-      ))
+      capnp::dynamic_value::Reader::List(reader) => {
+        write_array(codec, writer, reader.iter(), meta)
+      }
+      capnp::dynamic_value::Reader::AnyPointer(_) => {
+        Err(capnp::Error::unimplemented(
+          "AnyPointer cannot be represented in JSON".into(),
+        ))
+      }
+      capnp::dynamic_value::Reader::Capability(_) => {
+        Err(capnp::Error::unimplemented(
+          "Capability cannot be represented in JSON".into(),
+        ))
+      }
     }
   }
 }
@@ -141,6 +263,7 @@ fn write_string<W: std::io::Write>(
 }
 
 fn write_array<'reader, W: std::io::Write, I>(
+  codec: &super::Codec,
   writer: &mut W,
   items: I,
   meta: &EncodingOptions,
@@ -155,13 +278,14 @@ where
       write!(writer, ",")?;
     }
     first = false;
-    serialize_value_to(writer, item?, meta, &mut true)?;
+    serialize_value_to(codec, writer, item?, meta, &mut true)?;
   }
   write!(writer, "]")?;
   Ok(())
 }
 
 fn write_object<'reader, W: std::io::Write>(
+  codec: &super::Codec,
   writer: &mut W,
   reader: capnp::dynamic_struct::Reader<'reader>,
   meta: &EncodingOptions<'_, '_>,
@@ -192,7 +316,7 @@ fn write_object<'reader, W: std::io::Write>(
     if !reader.has(field)? {
       continue;
     }
-    let field_meta = EncodingOptions::from_field(&field_prefix, &field)?;
+    let field_meta = EncodingOptions::from_field(&field_prefix, field)?;
     if field_meta.flatten.is_none() {
       if !*first {
         write!(writer, ",")?;
@@ -205,7 +329,7 @@ fn write_object<'reader, W: std::io::Write>(
       write!(writer, ":")?;
     }
     let field_value = reader.get(field)?;
-    serialize_value_to(writer, field_value, &field_meta, first)?;
+    serialize_value_to(codec, writer, field_value, &field_meta, first)?;
   }
 
   // Comment copied verbatim from the Cap'n Proto C++ implementation:
@@ -232,7 +356,7 @@ fn write_object<'reader, W: std::io::Write>(
 
   if let Some(active_union_member) = reader.which()? {
     let active_union_member_meta =
-      EncodingOptions::from_field(&field_prefix, &active_union_member)?;
+      EncodingOptions::from_field(&field_prefix, active_union_member)?;
     if reader.has(active_union_member)? {
       let mut value_name = active_union_member_meta.name;
       let mut suppress_void = false;
@@ -280,6 +404,7 @@ fn write_object<'reader, W: std::io::Write>(
           write!(writer, ":")?;
         }
         serialize_value_to(
+          codec,
           writer,
           field_value,
           &active_union_member_meta,

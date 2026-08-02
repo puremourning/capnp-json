@@ -7,6 +7,7 @@ fn main() {
   // from the generated module names.
   capnpc::CompilerCommand::new()
     .file(root_dir.clone() + "/json.capnp")
+    .file(root_dir.clone() + "/rust-json.capnp")
     .src_prefix(root_dir)
     .run()
     .expect("compiling json.capnp");

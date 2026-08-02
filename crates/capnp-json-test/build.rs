@@ -5,6 +5,10 @@ fn main() {
     .file("test.capnp")
     .file("json-test.capnp")
     .file("test-compat.capnp")
+    .import_path(
+      std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .join("../capnp-json"),
+    )
     .run()
     .expect("compiling schema");
 }
