@@ -46,49 +46,43 @@ fn write_json_value<W: std::io::Write>(
   }
 
   match value {
-    JsonValue::Null => write!(writer, "null").map_err(|e| e.into()),
-    JsonValue::Boolean(v) => {
-      if *v {
-        write!(writer, "true").map_err(|e| e.into())
-      } else {
-        write!(writer, "false").map_err(|e| e.into())
-      }
-    }
-    JsonValue::Number(v) => write_number(writer, *v),
+    JsonValue::Null => writer.write_all(b"null").map_err(Into::into),
+    JsonValue::Boolean(v) => writer
+      .write_all(if *v { b"true" } else { b"false" })
+      .map_err(Into::into),
+    JsonValue::Number(v) => write_float(writer, *v),
     JsonValue::String(v) => write_string(writer, v.as_str()),
     JsonValue::Array(json_values) => {
-      write!(writer, "[")?;
+      writer.write_all(b"[")?;
       let mut first = true;
       for item in json_values {
         if !first {
-          write!(writer, ",")?;
+          writer.write_all(b",")?;
         }
         first = false;
         write_json_value(writer, item, &EncodingOptions::default(), &mut true)?;
       }
-      write!(writer, "]")?;
+      writer.write_all(b"]")?;
       Ok(())
     }
     JsonValue::Object(hash_map) => {
       let mut my_first = true;
       let first = if !flatten {
-        write!(writer, "{{")?;
+        writer.write_all(b"{")?;
         &mut my_first
       } else {
         first
       };
       for (key, value) in hash_map {
         if !*first {
-          write!(writer, ",")?;
+          writer.write_all(b",")?;
         }
         *first = false;
-        let field_name = format!("{field_prefix}{key}");
-        write_string(writer, field_name.as_str())?;
-        write!(writer, ":")?;
+        write_key(writer, &field_prefix, key)?;
         write_json_value(writer, value, &EncodingOptions::default(), first)?;
       }
       if !flatten {
-        write!(writer, "}}")?;
+        writer.write_all(b"}")?;
       }
       Ok(())
     }
@@ -110,6 +104,12 @@ where
 {
   if let Some(field_codec) =
     meta.codec.and_then(|c| codec.registry.get(c)).or_else(|| {
+      // Consulting the override maps means hashing the field, and this runs
+      // for every value encoded. Most codecs register no overrides at all, so
+      // rule that out first.
+      if codec.field_overrides.is_empty() && codec.type_overrides.is_empty() {
+        return None;
+      }
       meta.field.and_then(|f| {
         codec
           .field_overrides
@@ -122,35 +122,34 @@ where
   } else {
     match reader {
       capnp::dynamic_value::Reader::Void => {
-        write!(writer, "null").map_err(|e| e.into())
+        writer.write_all(b"null").map_err(Into::into)
       }
-      capnp::dynamic_value::Reader::Bool(value) => if value {
-        write!(writer, "true")
-      } else {
-        write!(writer, "false")
-      }
-      .map_err(|e| e.into()),
-      capnp::dynamic_value::Reader::Int8(value) => write_number(writer, value),
-      capnp::dynamic_value::Reader::Int16(value) => write_number(writer, value),
-      capnp::dynamic_value::Reader::Int32(value) => write_number(writer, value),
+      capnp::dynamic_value::Reader::Bool(value) => writer
+        .write_all(if value { b"true" } else { b"false" })
+        .map_err(Into::into),
+      capnp::dynamic_value::Reader::Int8(value) => write_int(writer, value),
+      capnp::dynamic_value::Reader::Int16(value) => write_int(writer, value),
+      capnp::dynamic_value::Reader::Int32(value) => write_int(writer, value),
+      // 64-bit integers go out as strings, but digits never need escaping, so
+      // they are written straight between the quotes.
       capnp::dynamic_value::Reader::Int64(value) => {
-        write_string(writer, format!("{value}").as_str())
+        writer.write_all(b"\"")?;
+        write_int(writer, value)?;
+        writer.write_all(b"\"").map_err(Into::into)
       }
-      capnp::dynamic_value::Reader::UInt8(value) => write_number(writer, value),
-      capnp::dynamic_value::Reader::UInt16(value) => {
-        write_number(writer, value)
-      }
-      capnp::dynamic_value::Reader::UInt32(value) => {
-        write_number(writer, value)
-      }
+      capnp::dynamic_value::Reader::UInt8(value) => write_int(writer, value),
+      capnp::dynamic_value::Reader::UInt16(value) => write_int(writer, value),
+      capnp::dynamic_value::Reader::UInt32(value) => write_int(writer, value),
       capnp::dynamic_value::Reader::UInt64(value) => {
-        write_string(writer, format!("{value}").as_str())
+        writer.write_all(b"\"")?;
+        write_int(writer, value)?;
+        writer.write_all(b"\"").map_err(Into::into)
       }
       capnp::dynamic_value::Reader::Float32(value) => {
-        write_number(writer, value)
+        write_float(writer, value)
       }
       capnp::dynamic_value::Reader::Float64(value) => {
-        write_number(writer, value)
+        write_float(writer, value)
       }
       capnp::dynamic_value::Reader::Enum(value) => {
         if let Some(enumerant) = value.get_enumerant()? {
@@ -166,7 +165,7 @@ where
             .unwrap_or(enumerant.get_proto().get_name()?.to_str());
           write_string(writer, value?)
         } else {
-          write_number(writer, value.get_value())
+          write_int(writer, value.get_value())
         }
       }
       capnp::dynamic_value::Reader::Text(reader) => {
@@ -225,13 +224,24 @@ where
   }
 }
 
-fn write_number<W: std::io::Write>(
+/// Write an integer. Integers go out as JSON numbers verbatim; they are never
+/// non-finite and never need quoting or escaping, so this is just the digits.
+///
+/// Kept separate from [`write_float`] because routing an integer through `f64`
+/// formatting, as this used to, is both slower and harder to read than
+/// formatting it as what it is.
+fn write_int<W: std::io::Write>(
   writer: &mut W,
-  value: impl TryInto<f64>,
+  value: impl std::fmt::Display,
 ) -> capnp::Result<()> {
-  let value = value
-    .try_into()
-    .map_err(|_| capnp::Error::failed("Value out of range".into()))?;
+  write!(writer, "{value}").map_err(Into::into)
+}
+
+fn write_float<W: std::io::Write>(
+  writer: &mut W,
+  value: impl Into<f64>,
+) -> capnp::Result<()> {
+  let value: f64 = value.into();
 
   // From the C++ codec comments:
   // Inf, -inf and NaN are not allowed in the JSON spec. Storing into string.
@@ -239,14 +249,88 @@ fn write_number<W: std::io::Write>(
   if value.is_finite() {
     write!(writer, "{value}")?;
   } else if value.is_nan() {
-    write_string(writer, "NaN")?;
-  } else if value.is_infinite() {
-    if value.is_sign_positive() {
-      write_string(writer, "Infinity")?;
-    } else {
-      write_string(writer, "-Infinity")?;
-    }
+    writer.write_all(b"\"NaN\"")?;
+  } else if value.is_sign_positive() {
+    writer.write_all(b"\"Infinity\"")?;
+  } else {
+    writer.write_all(b"\"-Infinity\"")?;
   }
+  Ok(())
+}
+
+/// Write a string's contents, escaped, without the surrounding quotes.
+///
+/// Characters needing no escape are written in runs rather than one at a time:
+/// the common case is a whole string with nothing to escape, which becomes a
+/// single `write_all` of the original bytes.
+fn write_escaped<W: std::io::Write>(
+  writer: &mut W,
+  value: &str,
+) -> capnp::Result<()> {
+  let bytes = value.as_bytes();
+  // Start of the run of bytes that can be written as-is.
+  let mut run = 0;
+  let mut i = 0;
+
+  // Scanning bytes rather than characters is safe here, and much cheaper than
+  // decoding UTF-8 for every character. Everything needing an escape is
+  // ASCII, except the C1 controls U+0080-U+009F, which are always the two
+  // bytes `C2 80`..`C2 9F`. No byte of a multi-byte sequence can be confused
+  // with one of those cases: continuation bytes are 0x80..=0xBF and `C2`
+  // never appears as one, so a match is always at a character boundary.
+  while i < bytes.len() {
+    let byte = bytes[i];
+    if byte >= 0x20
+      && byte != b'\"'
+      && byte != b'\\'
+      && byte != 0x7F
+      && byte != 0xC2
+    {
+      i += 1;
+      continue;
+    }
+
+    let escape: &[u8] = match byte {
+      b'\"' => b"\\\"",
+      b'\\' => b"\\\\",
+      b'\n' => b"\\n",
+      b'\r' => b"\\r",
+      b'\t' => b"\\t",
+      0x08 => b"\\b",
+      0x0C => b"\\f",
+      0xC2 => {
+        match bytes.get(i + 1) {
+          // A C1 control; its code point is the second byte's value.
+          Some(&next) if (0x80..=0x9F).contains(&next) => {
+            writer.write_all(&bytes[run..i])?;
+            write!(writer, "\\u{next:04x}")?;
+            i += 2;
+            run = i;
+          }
+          // Any other character that happens to start with `C2`.
+          _ => i += 1,
+        }
+        continue;
+      }
+      // The remaining C0 controls and DEL have no short form. Escaping DEL
+      // and the C1 range is wider than JSON demands, but is what this crate
+      // has always emitted.
+      other => {
+        writer.write_all(&bytes[run..i])?;
+        write!(writer, "\\u{other:04x}")?;
+        i += 1;
+        run = i;
+        continue;
+      }
+    };
+
+    writer.write_all(&bytes[run..i])?;
+    writer.write_all(escape)?;
+    i += 1;
+    run = i;
+  }
+
+  writer.write_all(&bytes[run..])?;
   Ok(())
 }
 
@@ -254,21 +338,24 @@ fn write_string<W: std::io::Write>(
   writer: &mut W,
   value: &str,
 ) -> capnp::Result<()> {
-  write!(writer, "\"")?;
-  for c in value.chars() {
-    match c {
-      '\"' => write!(writer, "\\\"")?,
-      '\\' => write!(writer, "\\\\")?,
-      '\n' => write!(writer, "\\n")?,
-      '\r' => write!(writer, "\\r")?,
-      '\t' => write!(writer, "\\t")?,
-      '\u{08}' => write!(writer, "\\b")?,
-      '\u{0C}' => write!(writer, "\\f")?,
-      c if c.is_control() => write!(writer, "\\u{:04x}", c as u32)?,
-      c => write!(writer, "{c}")?,
-    }
-  }
-  write!(writer, "\"")?;
+  writer.write_all(b"\"")?;
+  write_escaped(writer, value)?;
+  writer.write_all(b"\"")?;
+  Ok(())
+}
+
+/// Write `"<prefix><name>":`, the two halves of the key going into the same
+/// pair of quotes without being joined into a temporary first. Field names are
+/// written once per field, so the allocation this avoids is per-field.
+fn write_key<W: std::io::Write>(
+  writer: &mut W,
+  prefix: &str,
+  name: &str,
+) -> capnp::Result<()> {
+  writer.write_all(b"\"")?;
+  write_escaped(writer, prefix)?;
+  write_escaped(writer, name)?;
+  writer.write_all(b"\":")?;
   Ok(())
 }
 
@@ -281,16 +368,16 @@ fn write_array<'reader, W: std::io::Write, I>(
 where
   I: Iterator<Item = capnp::Result<capnp::dynamic_value::Reader<'reader>>>,
 {
-  write!(writer, "[")?;
+  writer.write_all(b"[")?;
   let mut first = true;
   for item in items {
     if !first {
-      write!(writer, ",")?;
+      writer.write_all(b",")?;
     }
     first = false;
     serialize_value_to(codec, writer, item?, meta, &mut true)?;
   }
-  write!(writer, "]")?;
+  writer.write_all(b"]")?;
   Ok(())
 }
 
@@ -317,7 +404,7 @@ fn write_object<'reader, W: std::io::Write>(
   let mut my_first = true;
 
   let first = if !flatten {
-    write!(writer, "{{")?;
+    writer.write_all(b"{")?;
     &mut my_first
   } else {
     first
@@ -329,14 +416,10 @@ fn write_object<'reader, W: std::io::Write>(
     let field_meta = EncodingOptions::from_field(&field_prefix, field)?;
     if field_meta.flatten.is_none() {
       if !*first {
-        write!(writer, ",")?;
+        writer.write_all(b",")?;
       }
       *first = false;
-      write_string(
-        writer,
-        format!("{}{}", field_prefix, field_meta.name).as_str(),
-      )?;
-      write!(writer, ":")?;
+      write_key(writer, &field_prefix, field_meta.name)?;
     }
     let field_value = reader.get(field)?;
     serialize_value_to(codec, writer, field_value, &field_meta, first)?;
@@ -389,15 +472,11 @@ fn write_object<'reader, W: std::io::Write>(
 
         if let Some(discriminator_name) = discriminator_name {
           if !*first {
-            write!(writer, ",")?;
+            writer.write_all(b",")?;
           }
           *first = false;
           suppress_void = true;
-          write_string(
-            writer,
-            format!("{field_prefix}{discriminator_name}").as_str(),
-          )?;
-          write!(writer, ":")?;
+          write_key(writer, &field_prefix, discriminator_name)?;
           write_string(writer, active_union_member_meta.name)?;
         }
       }
@@ -407,11 +486,10 @@ fn write_object<'reader, W: std::io::Write>(
       {
         if active_union_member_meta.flatten.is_none() {
           if !*first {
-            write!(writer, ",")?;
+            writer.write_all(b",")?;
           }
           *first = false;
-          write_string(writer, format!("{field_prefix}{value_name}").as_str())?;
-          write!(writer, ":")?;
+          write_key(writer, &field_prefix, value_name)?;
         }
         serialize_value_to(
           codec,
@@ -424,7 +502,7 @@ fn write_object<'reader, W: std::io::Write>(
     }
   }
   if !flatten {
-    write!(writer, "}}")?;
+    writer.write_all(b"}")?;
   }
   Ok(())
 }
@@ -436,19 +514,29 @@ fn write_data<W: std::io::Write>(
 ) -> capnp::Result<()> {
   match encoding {
     DataEncoding::Default => {
-      write!(writer, "[")?;
+      writer.write_all(b"[")?;
       let mut first = true;
       for byte in data.iter() {
         if !first {
-          write!(writer, ",")?;
+          writer.write_all(b",")?;
         }
         first = false;
-        write_number(writer, *byte)?;
+        write_int(writer, *byte)?;
       }
-      write!(writer, "]")?;
+      writer.write_all(b"]")?;
       Ok(())
     }
-    DataEncoding::Base64 => write_string(writer, base64::encode(data).as_str()),
-    DataEncoding::Hex => write_string(writer, hex::encode(data).as_str()),
+    // Base64 and hex output is ASCII by construction, so it needs no escaping
+    // and can be written straight into the writer.
+    DataEncoding::Base64 => {
+      writer.write_all(b"\"")?;
+      base64::encode_to(writer, data)?;
+      writer.write_all(b"\"").map_err(Into::into)
+    }
+    DataEncoding::Hex => {
+      writer.write_all(b"\"")?;
+      hex::encode_to(writer, data)?;
+      writer.write_all(b"\"").map_err(Into::into)
+    }
   }
 }
