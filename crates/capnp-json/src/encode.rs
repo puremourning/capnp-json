@@ -201,10 +201,14 @@ where
       capnp::dynamic_value::Reader::List(reader) => {
         write_array(codec, writer, reader.iter(), meta)
       }
-      capnp::dynamic_value::Reader::AnyPointer(_) => {
-        Err(capnp::Error::unimplemented(
-          "AnyPointer cannot be represented in JSON".into(),
-        ))
+      capnp::dynamic_value::Reader::AnyPointer(any) => {
+        if !any.is_null() {
+          Err(capnp::Error::unimplemented(
+            "AnyPointer cannot be represented in JSON".into(),
+          ))
+        } else {
+          Ok(())
+        }
       }
       capnp::dynamic_value::Reader::Capability(_) => {
         Err(capnp::Error::unimplemented(

@@ -816,14 +816,18 @@ fn decode_struct(
       }
 
       capnp::introspect::TypeVariant::AnyPointer => {
-        return Err(capnp::Error::unimplemented(
-          "AnyPointer cannot be represented in JSON".into(),
-        ));
+        if obj.remove(value_name).is_some() {
+          return Err(capnp::Error::unimplemented(
+            "AnyPointer cannot be represented in JSON".into(),
+          ));
+        }
       }
       capnp::introspect::TypeVariant::Capability => {
-        return Err(capnp::Error::unimplemented(
-          "Capability cannot be represented in JSON".into(),
-        ));
+        if obj.remove(value_name).is_some() {
+          return Err(capnp::Error::unimplemented(
+            "Capability cannot be represented in JSON".into(),
+          ));
+        }
       }
 
       _ => {
