@@ -52,6 +52,16 @@
 //! cannot represent the full 64-bit range exactly. When decoding, both the
 //! string and the number form are accepted for `Int64`/`UInt64`.
 //!
+//! Integer fields are range-checked on decode, as they are in C++: a number
+//! outside the field's range, or one with a fractional part, is an error
+//! rather than being silently clamped or truncated. `300` is not an `Int8`
+//! and `1.9` is not an `Int32`. The same applies to the elements of a `Data`
+//! array, which must be whole numbers in `[0, 255]`.
+//!
+//! Float fields are *not* range-checked, also matching C++: a magnitude too
+//! large for a `Float32` becomes an infinity. Enum ordinals given as numbers
+//! are not checked either.
+//!
 //! On encode, a field is omitted entirely when it is unset — for pointer
 //! fields (text, data, lists, structs) that means a null pointer. On decode, a
 //! field absent from the JSON is left at its schema default, and a JSON field
@@ -120,9 +130,12 @@
 //! when decoding input from an untrusted or third-party producer:
 //!
 //! - Input after the top-level value is ignored rather than rejected.
-//! - Numbers are range-checked only loosely: a value too large for the target
-//!   integer type is saturated rather than rejected, where C++ raises an
-//!   error.
+//! - A `Data` element above 255 is rejected. C++ intends the same — its error
+//!   says "not an integer in [0, 255]" — but implements the bound as
+//!   `byte(x) == x`, whose out-of-range `double`-to-`byte` conversion is
+//!   undefined behaviour; in practice it accepts `256`, `300` and `511` and
+//!   stores them modulo 256. Being stricter cannot break round-tripping,
+//!   since the C++ encoder never emits such a value.
 //! - `\uXXXX` escapes are decoded individually, so a surrogate pair — the way
 //!   any non-BMP character is written by an escaping JSON producer — is
 //!   rejected. Non-BMP characters written literally as UTF-8 are fine.

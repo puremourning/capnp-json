@@ -281,6 +281,45 @@ pub(crate) fn parse(
   decode_struct(0, codec, &mut value, builder, &meta)
 }
 
+/// Convert a JSON number to an integer, rejecting anything the target type
+/// cannot hold exactly.
+///
+/// JSON numbers are `f64`, so `300` is a perfectly well-formed JSON number to
+/// find in an `Int8` field, and `1.9` in an `Int32`. Converting with `as`
+/// would silently store 127 and 1 respectively and report success, turning
+/// malformed input into plausible-looking data.
+///
+/// The C++ codec rejects both, via three checks in `capnp/dynamic.c++`:
+/// `value >= MIN`, `value <= MAX`, and `T(value) == value`. Converting and
+/// converting back tests all three at once: Rust's float-to-integer `as`
+/// saturates, so anything outside the range comes back as the clamped bound,
+/// and any fractional part is lost — either way the round trip differs from
+/// the input. `NaN` and the infinities fail too, since neither survives the
+/// round trip.
+///
+/// This deliberately does not apply to floats or to enum ordinals, neither of
+/// which C++ range-checks: `1e300` into a `Float32` gives `inf` there and
+/// here.
+macro_rules! checked_int {
+  ($value:expr, $rust_ty:ty, $capnp_ty:literal, $field:expr) => {{
+    let value: f64 = $value;
+    let converted = value as $rust_ty;
+    if converted as f64 == value {
+      Ok(converted)
+    } else if value.trunc() == value {
+      Err(capnp::Error::failed(format!(
+        "Value {value} is out of range for {} field {}",
+        $capnp_ty, $field
+      )))
+    } else {
+      Err(capnp::Error::failed(format!(
+        "Value {value} is not an integer, required for {} field {}",
+        $capnp_ty, $field
+      )))
+    }
+  }};
+}
+
 fn decode_primitive<'json, 'meta>(
   field_value: &'json mut JsonValue,
   field_type: &'meta capnp::introspect::Type,
@@ -313,7 +352,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as i8).into())
+      Ok(checked_int!(*field_value, i8, "Int8", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::Int16 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -322,7 +361,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as i16).into())
+      Ok(checked_int!(*field_value, i16, "Int16", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::Int32 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -331,10 +370,12 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as i32).into())
+      Ok(checked_int!(*field_value, i32, "Int32", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::Int64 => match field_value {
-      JsonValue::Number(field_value) => Ok((*field_value as i64).into()),
+      JsonValue::Number(field_value) => {
+        Ok(checked_int!(*field_value, i64, "Int64", field_meta.name)?.into())
+      }
       JsonValue::String(field_value) => Ok(
         (field_value.parse::<i64>().map_err(|_| {
           capnp::Error::failed(format!(
@@ -356,7 +397,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as u8).into())
+      Ok(checked_int!(*field_value, u8, "UInt8", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::UInt16 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -365,7 +406,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as u16).into())
+      Ok(checked_int!(*field_value, u16, "UInt16", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::UInt32 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -374,10 +415,12 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as u32).into())
+      Ok(checked_int!(*field_value, u32, "UInt32", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::UInt64 => match field_value {
-      JsonValue::Number(field_value) => Ok((*field_value as u64).into()),
+      JsonValue::Number(field_value) => {
+        Ok(checked_int!(*field_value, u64, "UInt64", field_meta.name)?.into())
+      }
       JsonValue::String(field_value) => Ok(
         (field_value.parse::<u64>().map_err(|_| {
           capnp::Error::failed(format!(
@@ -516,7 +559,13 @@ fn decode_primitive<'json, 'meta>(
               field_meta.name
             )));
           };
-          data.push(byte_value as u8);
+          // C++: "Number in byte array is not an integer in [0, 255]".
+          data.push(checked_int!(
+            byte_value,
+            u8,
+            "Data byte in",
+            field_meta.name
+          )?);
         }
         *field_value = JsonValue::DataBuffer(data);
         Ok(capnp::dynamic_value::Reader::Data(match field_value {

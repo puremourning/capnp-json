@@ -1815,4 +1815,176 @@ mod tests {
       t.join().expect("worker thread panicked");
     }
   }
+
+  // -------------------------------------------------------------------
+  // Integer range checking
+  //
+  // JSON numbers are f64, so out-of-range and fractional values are
+  // well-formed JSON that the target type cannot hold. Converting with `as`
+  // saturates and truncates silently, turning bad input into plausible data.
+  // Every expectation below is the verdict `capnp convert json:text` gives
+  // for the same input.
+  // -------------------------------------------------------------------
+
+  /// Values outside the target type's range are rejected, not clamped.
+  #[test]
+  fn out_of_range_integers_are_rejected() {
+    use crate::test_capnp::test_json_types;
+
+    // (json, the value `as` would have silently stored)
+    let cases = [
+      (r#"{"int8Field":300}"#, "127"),
+      (r#"{"int8Field":-200}"#, "-128"),
+      (r#"{"int16Field":40000}"#, "32767"),
+      (r#"{"int32Field":1e300}"#, "2147483647"),
+      (r#"{"uInt8Field":-5}"#, "0"),
+      (r#"{"uInt8Field":256}"#, "255"),
+      (r#"{"uInt32Field":-1}"#, "0"),
+      (r#"{"int64Field":1e300}"#, "i64::MAX"),
+      (r#"{"uInt64Field":-1}"#, "0"),
+    ];
+
+    for (json, would_have_stored) in cases {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(json, root) else {
+        panic!(
+          "{json} must be rejected, not silently stored as {would_have_stored}"
+        );
+      };
+      assert_eq!(e.kind, capnp::ErrorKind::Failed);
+      assert!(
+        e.extra.contains("out of range"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+  }
+
+  /// Numbers with a fractional part are rejected for integer fields; C++
+  /// makes the same check (`T(value) == value`).
+  #[test]
+  fn fractional_numbers_are_rejected_for_integers() {
+    use crate::test_capnp::test_json_types;
+
+    for json in [
+      r#"{"int32Field":1.9}"#,
+      r#"{"int32Field":-1.9}"#,
+      r#"{"uInt8Field":0.5}"#,
+      r#"{"int64Field":1.5}"#,
+    ] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(json, root) else {
+        panic!("{json} must be rejected rather than truncated");
+      };
+      assert!(
+        e.extra.contains("is not an integer"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+  }
+
+  /// The boundary values themselves must still be accepted.
+  #[test]
+  fn in_range_integers_are_accepted() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = concat!(
+      r#"{"int8Field":-128,"int16Field":32767,"int32Field":-2147483648,"#,
+      r#""uInt8Field":255,"uInt16Field":65535,"uInt32Field":4294967295,"#,
+      r#""int64Field":"-9223372036854775808","#,
+      r#""uInt64Field":"18446744073709551615","#,
+      r#""float64Field":2.5}"#
+    );
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(json, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert_eq!(r.get_int8_field(), i8::MIN);
+    assert_eq!(r.get_int16_field(), i16::MAX);
+    assert_eq!(r.get_int32_field(), i32::MIN);
+    assert_eq!(r.get_u_int8_field(), u8::MAX);
+    assert_eq!(r.get_u_int16_field(), u16::MAX);
+    assert_eq!(r.get_u_int32_field(), u32::MAX);
+    assert_eq!(r.get_int64_field(), i64::MIN);
+    assert_eq!(r.get_u_int64_field(), u64::MAX);
+    // Whole-valued floats stay acceptable for float fields.
+    assert_eq!(r.get_float64_field(), 2.5);
+    Ok(())
+  }
+
+  /// Data is a byte array, so each element must be an integer in [0, 255].
+  ///
+  /// We are deliberately stricter than the C++ codec on the upper bound. C++
+  /// checks `byte(x) == x`, whose out-of-range `double` -> `byte` conversion
+  /// is undefined behaviour; in practice it lets 256, 300 and 511 through and
+  /// stores them modulo 256 (300 becomes 44), while correctly rejecting -5 and
+  /// 1.5. Its own message -- "Number in byte array is not an integer in
+  /// [0, 255]" -- says what it meant to do, and that is what we enforce. This
+  /// cannot break round-tripping, because the C++ encoder never emits a byte
+  /// outside [0, 255] in the first place.
+  #[test]
+  fn data_bytes_are_range_checked() {
+    use crate::test_capnp::test_blob;
+
+    for json in [
+      r#"{"dataField":[300]}"#,
+      r#"{"dataField":[-5]}"#,
+      r#"{"dataField":[256]}"#,
+      r#"{"dataField":[1.5]}"#,
+    ] {
+      let mut builder = message::Builder::new_default();
+      let root: test_blob::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(json, root) else {
+        panic!("{json} must be rejected; bytes outside [0, 255] are not data");
+      };
+      assert!(
+        e.extra.contains("Data byte"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+
+    // The full byte range still round-trips.
+    let mut builder = message::Builder::new_default();
+    let mut root: test_blob::Builder<'_> = builder.init_root();
+    json::from_json(r#"{"dataField":[0,127,255]}"#, root.reborrow()).unwrap();
+    assert_eq!(
+      root.reborrow_as_reader().get_data_field().unwrap(),
+      &[0u8, 127, 255]
+    );
+  }
+
+  /// Floats are deliberately *not* range-checked, matching C++: an
+  /// out-of-range value saturates to an infinity rather than erroring.
+  #[test]
+  fn floats_are_not_range_checked() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(r#"{"float32Field":1e300}"#, root.reborrow())?;
+    assert!(root.reborrow_as_reader().get_float32_field().is_infinite());
+    Ok(())
+  }
+
+  /// The string spellings of the non-finite floats are for float fields only.
+  /// They must not decode into an integer field, where `as` would have turned
+  /// them into 0 and `i32::MAX`.
+  #[test]
+  fn non_finite_strings_are_rejected_for_integers() {
+    use crate::test_capnp::test_json_types;
+
+    for json in [r#"{"int32Field":"NaN"}"#, r#"{"int32Field":"Infinity"}"#] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      assert!(
+        json::from_json(json, root).is_err(),
+        "{json} must not decode to an integer"
+      );
+    }
+  }
 }

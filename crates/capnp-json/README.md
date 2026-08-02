@@ -68,7 +68,10 @@ struct MyStruct {
 ## Supported features
 
 - All primitive Cap'n Proto types, including `Int64` / `UInt64` encoded as
-  JSON strings (matching the C++ codec).
+  JSON strings (matching the C++ codec). Integer fields and `Data` bytes are
+  range-checked on decode, so an out-of-range or fractional number is an error
+  rather than being silently clamped; floats and enum ordinals are not
+  checked, matching C++.
 - `Float32` / `Float64` `NaN`, `Infinity`, and `-Infinity` encoded as JSON
   strings.
 - Structs, lists, lists of lists, and lists of structs.
@@ -110,8 +113,6 @@ These matter mainly when decoding input you do not control; see the crate
 documentation for the full list.
 
 - Input after the top-level value is ignored rather than rejected.
-- Out-of-range numbers saturate to the target integer type instead of raising
-  an error.
 - `\uXXXX` surrogate pairs &mdash; how any non-BMP character is written by an
   escaping JSON producer &mdash; are rejected. Literal UTF-8 is fine.
 - A JSON `null` for a pointer-typed field is an error; C++ treats it as an
