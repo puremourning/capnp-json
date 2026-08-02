@@ -25,7 +25,7 @@ impl From<ParseError> for capnp::Error {
 
 use std::collections::HashMap;
 
-pub use super::JsonValue;
+use super::JsonValue;
 
 struct Parser<I>
 where
@@ -246,7 +246,7 @@ where
   }
 }
 
-pub fn parse(
+pub(crate) fn parse(
   codec: &super::Codec,
   json: &str,
   builder: capnp::dynamic_struct::Builder<'_>,

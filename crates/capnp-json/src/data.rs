@@ -1,10 +1,10 @@
 // We don't want to pull in base64 crate just for this. So hand-rolling a
 // base64 codec.
-pub mod base64 {
+pub(crate) mod base64 {
   const BASE64_CHARS: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-  pub fn encode(data: &[u8]) -> String {
+  pub(crate) fn encode(data: &[u8]) -> String {
     let mut encoded = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
       #[allow(clippy::get_first)]
@@ -32,7 +32,7 @@ pub mod base64 {
     encoded
   }
 
-  pub fn decode(data: &str) -> capnp::Result<Vec<u8>> {
+  pub(crate) fn decode(data: &str) -> capnp::Result<Vec<u8>> {
     let bytes = data.as_bytes();
     if bytes.len() % 4 != 0 {
       return Err(capnp::Error::failed(
@@ -77,7 +77,7 @@ pub mod base64 {
 
 // We don't want to pull in hex crate just for this. So hand-rolling a
 // hex codec.
-pub mod hex {
+pub(crate) mod hex {
   const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
   fn hex_char_to_value(c: u8) -> capnp::Result<u8> {
     match c {
@@ -91,7 +91,7 @@ pub mod hex {
     }
   }
 
-  pub fn encode(data: &[u8]) -> String {
+  pub(crate) fn encode(data: &[u8]) -> String {
     let mut encoded = String::with_capacity(data.len() * 2);
     for &byte in data {
       let high = HEX_CHARS[(byte >> 4) as usize];
@@ -102,7 +102,7 @@ pub mod hex {
     encoded
   }
 
-  pub fn decode(data: &str) -> capnp::Result<Vec<u8>> {
+  pub(crate) fn decode(data: &str) -> capnp::Result<Vec<u8>> {
     if data.len() % 2 != 0 {
       return Err(capnp::Error::failed(
         "Hex string must have even length".into(),

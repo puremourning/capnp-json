@@ -15,7 +15,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-capnp = "0.25"
+capnp = "0.27"
 capnp-json = "0.2.0"
 ```
 
@@ -82,14 +82,38 @@ struct MyStruct {
     discriminator field.
   - `$Json.base64` / `$Json.hex` &mdash; encode `Data` fields as Base64 or
     hex strings instead of arrays of bytes.
+- Custom per-field and per-type encodings, via the `FieldCodec` trait and
+  `Codec::with_field_override` / `with_type_override`. This is the equivalent
+  of the C++ codec's `Handler` API, and is what makes `AnyPointer` and
+  interface fields encodable.
+- Named codecs selected from the schema with this crate's own
+  `$Rust.codec("name")` annotation (see `rust-json.capnp`), registered with
+  `Codec::with_named_codec`.
 
 ## Not yet supported
 
 - The `Value` / `Call` / `raw` extensions from `json.capnp`.
-- `AnyPointer` and `Capability` fields (these are returned as errors).
-- Custom encoder/decoder handlers for specific types &mdash; the C++ codec
-  exposes a `Handler` API; this crate does not yet.
+- `AnyPointer` and interface fields, unless a `FieldCodec` is registered for
+  them.
 - Pretty-printed output.
+
+## Known divergences from the C++ codec
+
+These matter mainly when decoding input you do not control; see the crate
+documentation for the full list.
+
+- **No JSON nesting depth limit.** The parser is recursive, so deeply nested
+  input can exhaust the stack and abort the process. The C++ codec caps
+  nesting at 64 levels. Bound the nesting depth of untrusted input yourself.
+- Input after the top-level value is ignored rather than rejected.
+- Out-of-range numbers saturate to the target integer type instead of raising
+  an error.
+- `\uXXXX` surrogate pairs &mdash; how any non-BMP character is written by an
+  escaping JSON producer &mdash; are rejected. Literal UTF-8 is fine.
+- A JSON `null` for a pointer-typed field is an error; C++ treats it as an
+  absent field.
+- Only `Int64` / `UInt64` accept the string form of an integer when decoding;
+  C++ accepts it for every integer width.
 
 ## License
 

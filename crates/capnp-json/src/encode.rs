@@ -7,7 +7,7 @@ use super::{
   JsonValue,
 };
 
-pub fn serialize_json_to<'reader, W>(
+pub(crate) fn serialize_json_to<'reader, W>(
   codec: &super::Codec,
   writer: &mut W,
   reader: impl Into<capnp::dynamic_value::Reader<'reader>>,
