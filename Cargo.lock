@@ -4,8 +4,8 @@ version = 3
 
 [[package]]
 name = "capnp"
-version = "0.26.2"
-source = "git+https://github.com/puremourning/capnproto-rust?branch=json-hashable-field#c1397494d6fb9528e7d0f5d8515853ff7c6cf602"
+version = "0.27.0-alpha"
+source = "git+https://github.com/capnproto/capnproto-rust?branch=master#baeb528d01ace9a2001623d3f384c9dc3d9af000"
 dependencies = [
  "embedded-io",
 ]
@@ -29,8 +29,8 @@ dependencies = [
 
 [[package]]
 name = "capnpc"
-version = "0.26.0"
-source = "git+https://github.com/puremourning/capnproto-rust?branch=json-hashable-field#c1397494d6fb9528e7d0f5d8515853ff7c6cf602"
+version = "0.27.0-alpha"
+source = "git+https://github.com/capnproto/capnproto-rust?branch=master#baeb528d01ace9a2001623d3f384c9dc3d9af000"
 dependencies = [
  "capnp",
 ]
