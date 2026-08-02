@@ -201,14 +201,20 @@ where
       capnp::dynamic_value::Reader::List(reader) => {
         write_array(codec, writer, reader.iter(), meta)
       }
-      capnp::dynamic_value::Reader::AnyPointer(any) => {
-        if !any.is_null() {
-          Err(capnp::Error::unimplemented(
-            "AnyPointer cannot be represented in JSON".into(),
-          ))
-        } else {
-          Ok(())
-        }
+      // A *null* AnyPointer never reaches here. `write_object` skips any field
+      // for which `has()` is false, and `has()` is false for a null pointer
+      // (`Type::is_pointer_type` counts AnyPointer). Lists cannot supply one
+      // either: `capnp compile` rejects `List(AnyPointer)` outright, including
+      // via an unbound generic parameter. So reaching this arm means a
+      // non-null pointer, which is not representable.
+      //
+      // Do not be tempted to return `Ok(())` for the null case: callers have
+      // already written the field name and colon, or the separating comma,
+      // and a branch that writes nothing would produce malformed JSON.
+      capnp::dynamic_value::Reader::AnyPointer(_) => {
+        Err(capnp::Error::unimplemented(
+          "AnyPointer cannot be represented in JSON".into(),
+        ))
       }
       capnp::dynamic_value::Reader::Capability(_) => {
         Err(capnp::Error::unimplemented(

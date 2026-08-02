@@ -21,6 +21,14 @@
 
 // The cppcompat tests shell out to the `capnp` binary; miri can't intercept
 // `std::process::Command::spawn`, so the entire module is skipped under miri.
+//
+// Note that this validates against whatever `capnp` is installed, which is a
+// *release* (1.4.0 at the time of writing), whereas the codec is written
+// against the C++ main branch. The two already differ: `isPointerToJsonNull`
+// -- a JSON `null` meaning "field absent" for pointer-typed fields -- landed
+// in a4ce188e (2024-09-11) and is in no released tag, so this suite cannot
+// exercise it. Anything relying on post-release C++ behaviour has to be
+// checked against the source rather than asserted here.
 #[cfg(all(test, not(miri)))]
 mod tests {
   use std::io::Write;

@@ -67,6 +67,16 @@
 //! field absent from the JSON is left at its schema default, and a JSON field
 //! that does not correspond to anything in the schema is ignored.
 //!
+//! A null pointer and an absent field are the same thing in Cap'n Proto, so a
+//! JSON `null` for a `Text`, `Data`, `List` or struct field means the field
+//! was not set, rather than that it holds an empty value; the field is left
+//! alone. `Void` is the exception, since `null` is its value rather than its
+//! absence, and `Float32`/`Float64` read `null` as `NaN`. For every other type
+//! `null` is an error. This is only true of *fields*: as a list element,
+//! `null` has to be a value, so `[null]` is an error for a list of text. All
+//! of this matches the C++ codec (`isPointerToJsonNull`), though that
+//! behaviour is on its main branch and not in any release yet.
+//!
 //! # JSON annotations
 //!
 //! To use any of the JSON annotations defined in [`json.capnp`], tell `capnpc`
@@ -136,16 +146,15 @@
 //!   undefined behaviour; in practice it accepts `256`, `300` and `511` and
 //!   stores them modulo 256. Being stricter cannot break round-tripping,
 //!   since the C++ encoder never emits such a value.
-//! - `\uXXXX` escapes are decoded individually, so a surrogate pair — the way
-//!   any non-BMP character is written by an escaping JSON producer — is
-//!   rejected. Non-BMP characters written literally as UTF-8 are fine.
-//! - A JSON `null` for a pointer-typed field is an error; C++ treats it as an
-//!   absent field.
+//! - `\uXXXX` surrogate pairs are combined into the character they denote.
+//!   C++ decodes each escape separately and produces WTF-8 — the surrogates
+//!   encoded individually, which is not valid UTF-8 and which a Rust `String`
+//!   cannot hold — and notes as much in a TODO. Unpaired surrogates are
+//!   rejected here rather than replaced. This cannot affect round-tripping:
+//!   the C++ encoder writes non-BMP characters as literal UTF-8, never as
+//!   escapes.
 //! - Only `Int64`/`UInt64` accept the string form of an integer on decode;
 //!   C++ accepts it for every integer width.
-//! - Decoding a struct that *has* an `AnyPointer` or interface field fails
-//!   even when the JSON does not mention that field, unless a codec is
-//!   registered for it.
 //! - Duplicate keys within one JSON object are rejected.
 //! - Floats are written in Rust's `Display` form, which never uses exponent
 //!   notation: `1e300` is emitted as 301 digits rather than as `1e300`. Both
@@ -625,11 +634,9 @@ pub trait FieldCodec {
 }
 
 /// Lets a `&T` be used wherever a [`FieldCodec`] is expected, so one codec
-/// instance can be shared between several [`Codec`]s.
-///
-/// Note that this forwards only the two required methods: a `T` that
-/// overrides [`decode_member`](FieldCodec::decode_member) will have that
-/// override bypassed when used through a reference.
+/// instance can be shared between several [`Codec`]s. Every method is
+/// forwarded, including [`decode_member`](FieldCodec::decode_member), so a
+/// codec behaves the same by reference as it does by value.
 impl<T: FieldCodec + ?Sized> FieldCodec for &T {
   fn encode_value(
     &self,

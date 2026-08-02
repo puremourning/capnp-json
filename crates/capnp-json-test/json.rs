@@ -2007,4 +2007,278 @@ mod tests {
       );
     }
   }
+
+  // -------------------------------------------------------------------
+  // JSON null for pointer-typed fields
+  //
+  // A null pointer and an absent field are the same thing in Cap'n Proto, so
+  // C++ treats `null` for a Text/Data/List/Struct field as "not present"
+  // (isPointerToJsonNull). It matters for reading C++ output: the encoder
+  // emits `"field": null` for an active union member whose pointer is null.
+  // -------------------------------------------------------------------
+
+  /// `null` leaves a pointer-typed field unset rather than erroring, and
+  /// without allocating an empty value for it.
+  #[test]
+  fn null_means_absent_for_pointer_fields() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = concat!(
+      r#"{"textField":null,"dataField":null,"#,
+      r#""structField":null,"textList":null,"int8Field":7}"#
+    );
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(json, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert!(!r.has_text_field(), "null must not allocate a text field");
+    assert!(!r.has_data_field());
+    assert!(!r.has_struct_field(), "null must not init the struct");
+    assert!(!r.has_text_list());
+    // The rest of the object is still decoded.
+    assert_eq!(r.get_int8_field(), 7);
+    // ... and nothing was written, so it re-encodes without those fields.
+    assert!(!json::to_json(r)?.contains("textField"));
+    Ok(())
+  }
+
+  /// `null` is not blanket-accepted: only the pointer types treat it as
+  /// absence. `Void`'s *value* is null, so it must still be set.
+  #[test]
+  fn null_is_only_absence_for_pointer_types() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    for json in [
+      r#"{"int8Field":null}"#,
+      r#"{"uInt32Field":null}"#,
+      r#"{"boolField":null}"#,
+      r#"{"enumField":null}"#,
+    ] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      assert!(
+        json::from_json(json, root).is_err(),
+        "{json} must not be accepted; null is not a value for this type"
+      );
+    }
+
+    // Void decodes *from* null, so it must be accepted and set.
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(r#"{"voidField":null}"#, root.reborrow())?;
+    Ok(())
+  }
+
+  /// Floats take `null` as NaN, which is what C++ does.
+  #[test]
+  fn null_decodes_to_nan_for_floats() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(
+      r#"{"float32Field":null,"float64Field":null,"float32List":[null,1.5]}"#,
+      root.reborrow(),
+    )?;
+
+    let r = root.reborrow_as_reader();
+    assert!(r.get_float32_field().is_nan());
+    assert!(r.get_float64_field().is_nan());
+    // The rule lives in the value decoder, so list elements get it too.
+    let list = r.get_float32_list()?;
+    assert!(list.get(0).is_nan());
+    assert_eq!(list.get(1), 1.5);
+    Ok(())
+  }
+
+  /// Absence is a property of the *field*, so it does not extend to list
+  /// elements: C++ decodes arrays without the check, and so do we.
+  #[test]
+  fn null_is_still_an_error_as_a_list_element() {
+    use crate::test_capnp::test_json_types;
+
+    for json in [r#"{"textList":[null]}"#, r#"{"structList":[null]}"#] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      assert!(
+        json::from_json(json, root).is_err(),
+        "{json}: null is not a text or struct value"
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // \uXXXX surrogate pairs
+  // -------------------------------------------------------------------
+
+  /// Write each UTF-16 code unit as a JSON `\uXXXX` escape.
+  ///
+  /// Built at runtime rather than written as a source literal on purpose: an
+  /// editor or tool that normalises escape sequences will happily turn a
+  /// literal surrogate pair into the character it denotes, which would leave
+  /// these tests silently exercising the literal-UTF-8 path instead of the
+  /// escape path they exist for.
+  fn u_escapes(units: &[u16]) -> String {
+    let mut out = String::new();
+    for unit in units {
+      out.push('\\');
+      out.push('u');
+      out.push_str(&format!("{unit:04X}"));
+    }
+    out
+  }
+
+  fn text_field_json(body: &str) -> String {
+    format!("{{\"textField\":\"{body}\"}}")
+  }
+
+  /// A character above U+FFFF is written as a *pair* of `\u` escapes, which is
+  /// what any escaping JSON producer emits for an emoji. The two halves must
+  /// be recombined; decoding them separately yields unpaired surrogates, which
+  /// are not Unicode scalar values and cannot appear in UTF-8.
+  #[test]
+  fn surrogate_pairs_decode_to_one_character() -> capnp::Result<()> {
+    use crate::test_capnp::test_blob;
+
+    let cases = [
+      // U+1F600 GRINNING FACE.
+      (text_field_json(&u_escapes(&[0xD83D, 0xDE00])), "\u{1F600}"),
+      // U+10437, exercising a different pair of surrogates.
+      (text_field_json(&u_escapes(&[0xD801, 0xDC37])), "\u{10437}"),
+      // Surrounded by ordinary characters.
+      (
+        text_field_json(&format!("a{}b", u_escapes(&[0xD83D, 0xDE00]))),
+        "a\u{1F600}b",
+      ),
+      // Two pairs back to back: the parser must resume correctly after one.
+      (
+        text_field_json(&u_escapes(&[0xD83D, 0xDE00, 0xD83D, 0xDE01])),
+        "\u{1F600}\u{1F601}",
+      ),
+      // BMP escapes are unaffected.
+      (
+        text_field_json(&u_escapes(&[0x00E9, 0x4E2D])),
+        "\u{E9}\u{4E2D}",
+      ),
+      // The literal UTF-8 form keeps working; this is what C++ emits.
+      (text_field_json("\u{1F600}"), "\u{1F600}"),
+    ];
+
+    for (json, expected) in cases {
+      let mut builder = message::Builder::new_default();
+      let mut root: test_blob::Builder<'_> = builder.init_root();
+      json::from_json(&json, root.reborrow())?;
+      assert_eq!(
+        root.reborrow_as_reader().get_text_field()?.to_str()?,
+        expected,
+        "decoding {json}"
+      );
+    }
+    Ok(())
+  }
+
+  /// An unpaired surrogate has no UTF-8 representation at all, so it is
+  /// rejected rather than silently replaced with U+FFFD.
+  #[test]
+  fn unpaired_surrogates_are_rejected() {
+    use crate::test_capnp::test_blob;
+
+    let cases = [
+      // Leading surrogate at end of string.
+      text_field_json(&u_escapes(&[0xD83D])),
+      // Leading surrogate followed by an ordinary character.
+      text_field_json(&format!("{}x", u_escapes(&[0xD83D]))),
+      // Leading surrogate followed by a non-surrogate escape.
+      text_field_json(&u_escapes(&[0xD83D, 0x0041])),
+      // Two leading surrogates.
+      text_field_json(&u_escapes(&[0xD83D, 0xD83D])),
+      // Trailing surrogate on its own.
+      text_field_json(&u_escapes(&[0xDE00])),
+      // Trailing surrogate before a valid pair.
+      text_field_json(&u_escapes(&[0xDE00, 0xD83D, 0xDE00])),
+    ];
+
+    for json in cases {
+      let mut builder = message::Builder::new_default();
+      let root: test_blob::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(&json, root) else {
+        panic!("{json} must be rejected: unpaired surrogates are not UTF-8");
+      };
+      assert!(
+        e.extra.contains("surrogate"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+  }
+
+  /// The `&T` blanket impl must forward `decode_member`, not fall back to the
+  /// trait default. The default calls `init`, which is invalid for a
+  /// primitive field, so before this was forwarded the call failed with
+  /// `InitIsOnlyValidForStructAndAnyPointerFields`.
+  #[test]
+  fn ref_field_codec_forwards_decode_member() -> capnp::Result<()> {
+    use std::cell::Cell;
+
+    use crate::test_capnp::test_json_types;
+
+    struct Custom {
+      member_called: Cell<bool>,
+    }
+
+    impl json::FieldCodec for Custom {
+      fn encode_value(
+        &self,
+        _source: capnp::dynamic_value::Reader<'_>,
+      ) -> capnp::Result<JsonValue> {
+        Ok(JsonValue::Null)
+      }
+
+      fn decode_value(
+        &self,
+        _source: &JsonValue,
+        _target: capnp::dynamic_value::Builder<'_>,
+      ) -> capnp::Result<()> {
+        panic!("decode_value must not be reached; decode_member handles this")
+      }
+
+      fn decode_member(
+        &self,
+        _source: &JsonValue,
+        mut target: capnp::dynamic_struct::Builder<'_>,
+        field: capnp::schema::Field,
+      ) -> capnp::Result<()> {
+        self.member_called.set(true);
+        target.set(field, 42i8.into())
+      }
+    }
+
+    use capnp::introspect::Introspect;
+    let capnp::introspect::TypeVariant::Struct(schema) =
+      test_json_types::Owned::introspect().which()
+    else {
+      panic!("not a struct");
+    };
+    let field = capnp::schema::StructSchema::new(schema)
+      .get_field_by_name("int8Field")?;
+
+    let custom = Custom {
+      member_called: Cell::new(false),
+    };
+    // Register by reference, exercising `impl FieldCodec for &T`.
+    let codec = json::Codec::new()
+      .with_field_override(field, &custom as &dyn json::FieldCodec);
+
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    codec.decode(r#"{"int8Field":1}"#, root.reborrow())?;
+
+    assert!(
+      custom.member_called.get(),
+      "decode_member was not forwarded"
+    );
+    assert_eq!(root.reborrow_as_reader().get_int8_field(), 42);
+    Ok(())
+  }
 }

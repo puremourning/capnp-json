@@ -209,25 +209,7 @@ where
             'n' => result.push('\n'),
             'r' => result.push('\r'),
             't' => result.push('\t'),
-            'u' => {
-              let mut hex = String::new();
-              for _ in 0..4 {
-                hex.push(self.advance()?);
-              }
-              let code_point = u16::from_str_radix(&hex, 16).map_err(|_| {
-                ParseError::Other(format!("Invalid unicode escape: \\u{hex}"))
-              })?;
-              if let Some(ch) = std::char::from_u32(code_point as u32) {
-                result.push(ch);
-              } else {
-                return Err(
-                  ParseError::Other(format!(
-                    "Invalid unicode code point: \\u{hex}"
-                  ))
-                  .into(),
-                );
-              }
-            }
+            'u' => result.push(self.parse_unicode_escape()?),
             other => {
               return Err(
                 ParseError::Other(format!(
@@ -241,6 +223,98 @@ where
         other => result.push(other),
       }
     }
+  }
+
+  /// Read the four hex digits of a `\uXXXX` escape, the `\u` itself having
+  /// already been consumed.
+  fn parse_hex4(&mut self) -> capnp::Result<u16> {
+    let mut hex = String::with_capacity(4);
+    for _ in 0..4 {
+      hex.push(self.advance()?);
+    }
+    u16::from_str_radix(&hex, 16).map_err(|_| {
+      ParseError::Other(format!("Invalid unicode escape: \\u{hex}")).into()
+    })
+  }
+
+  /// Decode a `\uXXXX` escape, combining a surrogate pair into the single
+  /// character it stands for.
+  ///
+  /// A `\u` escape carries one UTF-16 code unit, which cannot reach beyond the
+  /// BMP on its own. Anything above U+FFFF is therefore written as a *pair* of
+  /// escapes — a high surrogate followed by a low one — which is how every
+  /// JSON producer that escapes its output (`JSON.stringify` with non-ASCII
+  /// escaping, Python's `json.dumps` by default) writes an emoji. Decoding the
+  /// two halves independently yields two unpaired surrogates, which are not
+  /// Unicode scalar values and so cannot appear in a Rust `String` or in
+  /// Cap'n Proto text.
+  ///
+  /// The C++ codec does decode them independently and produces WTF-8 — the two
+  /// surrogates encoded separately, which is not valid UTF-8 — and says as
+  /// much in a TODO. Matching that is not an option here, and is not needed
+  /// for interoperability either: the C++ *encoder* never emits `\u` escapes
+  /// for non-BMP characters, writing them as literal UTF-8, which decodes
+  /// through the ordinary path.
+  ///
+  /// An unpaired surrogate has no representation in UTF-8 at all, so it is
+  /// rejected rather than quietly replaced with U+FFFD.
+  fn parse_unicode_escape(&mut self) -> capnp::Result<char> {
+    const HIGH: std::ops::RangeInclusive<u16> = 0xD800..=0xDBFF;
+    const LOW: std::ops::RangeInclusive<u16> = 0xDC00..=0xDFFF;
+
+    let unit = self.parse_hex4()?;
+
+    if LOW.contains(&unit) {
+      return Err(
+        ParseError::Other(format!(
+          "Invalid unicode escape: \\u{unit:04X} is a trailing surrogate with \
+           no leading surrogate before it"
+        ))
+        .into(),
+      );
+    }
+
+    if HIGH.contains(&unit) {
+      // A leading surrogate is only half a character; the other half must be
+      // the very next escape.
+      if self.peek() != Some('\\') {
+        return Err(
+          ParseError::Other(format!(
+            "Invalid unicode escape: \\u{unit:04X} is a leading surrogate and \
+             must be followed by a \\u escape"
+          ))
+          .into(),
+        );
+      }
+      self.advance()?;
+      self.consume('u')?;
+
+      let low = self.parse_hex4()?;
+      if !LOW.contains(&low) {
+        return Err(
+          ParseError::Other(format!(
+            "Invalid unicode escape: \\u{unit:04X} must be followed by a \
+             trailing surrogate, found \\u{low:04X}"
+          ))
+          .into(),
+        );
+      }
+
+      let code_point =
+        0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+      return std::char::from_u32(code_point).ok_or_else(|| {
+        ParseError::Other(format!(
+          "Invalid unicode code point: \\u{unit:04X}\\u{low:04X}"
+        ))
+        .into()
+      });
+    }
+
+    // Not a surrogate, so it is a scalar value and the conversion cannot fail.
+    std::char::from_u32(unit as u32).ok_or_else(|| {
+      ParseError::Other(format!("Invalid unicode code point: \\u{unit:04X}"))
+        .into()
+    })
   }
 
   fn parse_number(&mut self) -> capnp::Result<String> {
@@ -279,6 +353,34 @@ pub(crate) fn parse(
   let mut value = parser.parse_value(&codec.options, 0)?;
   let meta = EncodingOptions::default();
   decode_struct(0, codec, &mut value, builder, &meta)
+}
+
+/// Whether a JSON `null` here means "this field is absent".
+///
+/// A null pointer and an absent field are the same thing in Cap'n Proto, so
+/// for the pointer types a JSON `null` says the field was not set rather than
+/// that it holds an empty value. This mirrors `isPointerToJsonNull` in the C++
+/// codec, and the type list is the same one: Text, Data, List and Struct.
+///
+/// `Void` is deliberately not in that list even though it encodes as `null`:
+/// `null` is its *value*, and a void field decoded from `null` must be set,
+/// not skipped. C++ excludes it for the same reason.
+///
+/// This is a property of the field, not of the value alone, so it applies only
+/// where a field is being decoded. C++ likewise checks it in `decodeField` and
+/// not in `decodeArray`, so `null` remains an error as a list element.
+fn is_pointer_to_json_null(
+  value: &JsonValue,
+  field_type: &capnp::introspect::Type,
+) -> bool {
+  matches!(value, JsonValue::Null)
+    && matches!(
+      field_type.which(),
+      capnp::introspect::TypeVariant::Text
+        | capnp::introspect::TypeVariant::Data
+        | capnp::introspect::TypeVariant::List(_)
+        | capnp::introspect::TypeVariant::Struct(_)
+    )
 }
 
 /// Convert a JSON number to an integer, rejecting anything the target type
@@ -437,6 +539,8 @@ fn decode_primitive<'json, 'meta>(
     },
     capnp::introspect::TypeVariant::Float32 => {
       let field_value = match field_value {
+        // C++ decodes a JSON null into a float as NaN.
+        JsonValue::Null => f32::NAN,
         JsonValue::Number(field_value) => *field_value as f32,
         JsonValue::String(field_value) => match field_value.as_str() {
           "NaN" => f32::NAN,
@@ -460,6 +564,8 @@ fn decode_primitive<'json, 'meta>(
     }
     capnp::introspect::TypeVariant::Float64 => {
       let field_value = match field_value {
+        // C++ decodes a JSON null into a float as NaN.
+        JsonValue::Null => f64::NAN,
         JsonValue::Number(field_value) => *field_value,
         JsonValue::String(field_value) => match field_value.as_str() {
           "NaN" => f64::NAN,
@@ -752,6 +858,9 @@ fn decode_struct(
             Some(v) => v,
             None => return Ok(()),
           };
+          if is_pointer_to_json_null(&field_value, &field.get_type()) {
+            return Ok(());
+          }
 
           let struct_builder = builder
             .reborrow()
@@ -795,6 +904,9 @@ fn decode_struct(
         let Some(field_value) = obj.remove(value_name) else {
           return Ok(());
         };
+        if is_pointer_to_json_null(&field_value, &field.get_type()) {
+          return Ok(());
+        }
 
         let JsonValue::Array(field_value) = field_value else {
           return Err(capnp::Error::failed(format!(
@@ -834,6 +946,9 @@ fn decode_struct(
         let Some(mut field_value) = obj.remove(value_name) else {
           return Ok(());
         };
+        if is_pointer_to_json_null(&field_value, &field.get_type()) {
+          return Ok(());
+        }
 
         builder.set(
           field,
