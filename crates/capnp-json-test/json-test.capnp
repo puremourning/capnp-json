@@ -177,3 +177,84 @@ struct StructWithCustomCodec {
   structLevel @0 :TestCustomCodec;
   fieldLevel @1 :Text $RustJson.codec("TestFieldCodec");
 }
+
+struct CyclicFlatten {
+  # A struct that flattens a field of its own type. The schema is legal, but
+  # decoding recurses on the *schema* while staying at the same depth in the
+  # JSON, so the parser's nesting limit cannot bound it. The C++ codec rejects
+  # this outright ("cyclic JSON flattening detected").
+  inner @0 :CyclicFlatten $Json.flatten(prefix="i.");
+  value @1 :UInt16;
+}
+
+struct SelfList {
+  # Self-reference through a list. Each level of nesting costs two levels of
+  # JSON nesting (object + array), so the parser limit bounds this one.
+  children @0 :List(SelfList);
+  value @1 :UInt16;
+}
+
+struct SelfStruct {
+  # Plain self-reference; one level of JSON nesting per level of schema.
+  inner @0 :SelfStruct;
+  value @1 :UInt16;
+}
+
+# Cyclic-flattening cases. The expected verdict against each is the one the
+# C++ codec gives (checked with `capnp convert`), since the point of the check
+# is that both implementations reject the same schemas.
+
+struct FlattenThroughGroup {
+  # Cyclic: C++ always loads a group's handler, flattened or not, so the group
+  # is an edge even though it nests in the JSON.
+  g :group {
+    a @0 :FlattenThroughGroup $Json.flatten();
+  }
+}
+
+struct MutualFlattenA {
+  # Cyclic: A -> B -> A, both flattened.
+  b @0 :MutualFlattenB $Json.flatten();
+}
+
+struct MutualFlattenB {
+  a @0 :MutualFlattenA $Json.flatten();
+}
+
+struct MutualOneFlatA {
+  # Not cyclic: the return edge is a plain struct field, which nests.
+  b @0 :MutualOneFlatB $Json.flatten();
+  value @1 :UInt16;
+}
+
+struct MutualOneFlatB {
+  a @0 :MutualOneFlatA;
+  other @1 :UInt16;
+}
+
+struct ReferencesCyclic {
+  # Not itself cyclic, but reaches a cyclic type through a plain field. C++
+  # loads handlers for the whole dependency graph, so this is rejected too.
+  x @0 :CyclicFlatten;
+}
+
+struct ReferencesCyclicViaList {
+  x @0 :List(CyclicFlatten);
+}
+
+struct FlattenLazy {
+  # A flattened struct field whose members can all be absent, so that decoding
+  # can be checked not to create it. `inner` is nested and prefixed, to check
+  # the same holds one level down.
+  outer @0 :FlattenLazyOuter $Json.flatten();
+  top @1 :UInt16;
+}
+
+struct FlattenLazyOuter {
+  a @0 :Text;
+  inner @1 :FlattenLazyInner $Json.flatten(prefix="in.");
+}
+
+struct FlattenLazyInner {
+  b @0 :Text;
+}

@@ -23,9 +23,9 @@ impl From<ParseError> for capnp::Error {
   }
 }
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-pub use super::JsonValue;
+use super::JsonValue;
 
 struct Parser<I>
 where
@@ -93,7 +93,29 @@ where
     }
   }
 
-  fn parse_value(&mut self) -> capnp::Result<JsonValue> {
+  /// Parse one JSON value.
+  ///
+  /// `recursion_level` counts the arrays and objects already entered, not the
+  /// values parsed, so that a scalar does not cost a level of its own. This
+  /// matches the C++ codec, whose `nestingDepth` is incremented only by
+  /// `parseArray` and `parseObject`; counting scalars too would make the same
+  /// numeric limit one level stricter than C++'s.
+  fn parse_value(
+    &mut self,
+    options: &crate::CodecOptions,
+    recursion_level: usize,
+  ) -> capnp::Result<JsonValue> {
+    // Entering a container takes the depth to `recursion_level + 1`, so the
+    // limit is reached when `recursion_level` has caught up with it.
+    let check_container_depth = || {
+      if recursion_level >= options.recursion_limit {
+        return Err(capnp::Error::failed(
+          "Recursion limit exceeded while parsing JSON".into(),
+        ));
+      }
+      Ok(())
+    };
+
     match self.peek_next() {
       None => Err(ParseError::UnexpectedEndOfInput.into()),
       Some('n') => {
@@ -127,6 +149,7 @@ where
         Ok(JsonValue::Number(num))
       }
       Some('[') => {
+        check_container_depth()?;
         self.advance()?;
         let mut items = Vec::new();
         let mut require_comma = false;
@@ -135,15 +158,16 @@ where
             self.consume(',')?;
           }
           require_comma = true;
-          let item = self.parse_value()?;
+          let item = self.parse_value(options, recursion_level + 1)?;
           items.push(item);
         }
         self.consume_next(']')?;
         Ok(JsonValue::Array(items))
       }
       Some('{') => {
+        check_container_depth()?;
         self.advance()?;
-        let mut members = HashMap::new();
+        let mut members = BTreeMap::new();
         let mut require_comma = false;
         while self.peek_next().is_some_and(|c| c != '}') {
           if require_comma {
@@ -152,7 +176,7 @@ where
           require_comma = true;
           let key = self.parse_string()?;
           self.consume_next(':')?;
-          let value = self.parse_value()?;
+          let value = self.parse_value(options, recursion_level + 1)?;
           if members.insert(key.clone(), value).is_some() {
             return Err(
               ParseError::Other(format!("Duplicate key in object: {key}"))
@@ -185,25 +209,7 @@ where
             'n' => result.push('\n'),
             'r' => result.push('\r'),
             't' => result.push('\t'),
-            'u' => {
-              let mut hex = String::new();
-              for _ in 0..4 {
-                hex.push(self.advance()?);
-              }
-              let code_point = u16::from_str_radix(&hex, 16).map_err(|_| {
-                ParseError::Other(format!("Invalid unicode escape: \\u{hex}"))
-              })?;
-              if let Some(ch) = std::char::from_u32(code_point as u32) {
-                result.push(ch);
-              } else {
-                return Err(
-                  ParseError::Other(format!(
-                    "Invalid unicode code point: \\u{hex}"
-                  ))
-                  .into(),
-                );
-              }
-            }
+            'u' => result.push(self.parse_unicode_escape()?),
             other => {
               return Err(
                 ParseError::Other(format!(
@@ -217,6 +223,98 @@ where
         other => result.push(other),
       }
     }
+  }
+
+  /// Read the four hex digits of a `\uXXXX` escape, the `\u` itself having
+  /// already been consumed.
+  fn parse_hex4(&mut self) -> capnp::Result<u16> {
+    let mut hex = String::with_capacity(4);
+    for _ in 0..4 {
+      hex.push(self.advance()?);
+    }
+    u16::from_str_radix(&hex, 16).map_err(|_| {
+      ParseError::Other(format!("Invalid unicode escape: \\u{hex}")).into()
+    })
+  }
+
+  /// Decode a `\uXXXX` escape, combining a surrogate pair into the single
+  /// character it stands for.
+  ///
+  /// A `\u` escape carries one UTF-16 code unit, which cannot reach beyond the
+  /// BMP on its own. Anything above U+FFFF is therefore written as a *pair* of
+  /// escapes — a high surrogate followed by a low one — which is how every
+  /// JSON producer that escapes its output (`JSON.stringify` with non-ASCII
+  /// escaping, Python's `json.dumps` by default) writes an emoji. Decoding the
+  /// two halves independently yields two unpaired surrogates, which are not
+  /// Unicode scalar values and so cannot appear in a Rust `String` or in
+  /// Cap'n Proto text.
+  ///
+  /// The C++ codec does decode them independently and produces WTF-8 — the two
+  /// surrogates encoded separately, which is not valid UTF-8 — and says as
+  /// much in a TODO. Matching that is not an option here, and is not needed
+  /// for interoperability either: the C++ *encoder* never emits `\u` escapes
+  /// for non-BMP characters, writing them as literal UTF-8, which decodes
+  /// through the ordinary path.
+  ///
+  /// An unpaired surrogate has no representation in UTF-8 at all, so it is
+  /// rejected rather than quietly replaced with U+FFFD.
+  fn parse_unicode_escape(&mut self) -> capnp::Result<char> {
+    const HIGH: std::ops::RangeInclusive<u16> = 0xD800..=0xDBFF;
+    const LOW: std::ops::RangeInclusive<u16> = 0xDC00..=0xDFFF;
+
+    let unit = self.parse_hex4()?;
+
+    if LOW.contains(&unit) {
+      return Err(
+        ParseError::Other(format!(
+          "Invalid unicode escape: \\u{unit:04X} is a trailing surrogate with \
+           no leading surrogate before it"
+        ))
+        .into(),
+      );
+    }
+
+    if HIGH.contains(&unit) {
+      // A leading surrogate is only half a character; the other half must be
+      // the very next escape.
+      if self.peek() != Some('\\') {
+        return Err(
+          ParseError::Other(format!(
+            "Invalid unicode escape: \\u{unit:04X} is a leading surrogate and \
+             must be followed by a \\u escape"
+          ))
+          .into(),
+        );
+      }
+      self.advance()?;
+      self.consume('u')?;
+
+      let low = self.parse_hex4()?;
+      if !LOW.contains(&low) {
+        return Err(
+          ParseError::Other(format!(
+            "Invalid unicode escape: \\u{unit:04X} must be followed by a \
+             trailing surrogate, found \\u{low:04X}"
+          ))
+          .into(),
+        );
+      }
+
+      let code_point =
+        0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
+      return std::char::from_u32(code_point).ok_or_else(|| {
+        ParseError::Other(format!(
+          "Invalid unicode code point: \\u{unit:04X}\\u{low:04X}"
+        ))
+        .into()
+      });
+    }
+
+    // Not a surrogate, so it is a scalar value and the conversion cannot fail.
+    std::char::from_u32(unit as u32).ok_or_else(|| {
+      ParseError::Other(format!("Invalid unicode code point: \\u{unit:04X}"))
+        .into()
+    })
   }
 
   fn parse_number(&mut self) -> capnp::Result<String> {
@@ -246,15 +344,88 @@ where
   }
 }
 
-pub fn parse(
+pub(crate) fn parse(
   codec: &super::Codec,
   json: &str,
   builder: capnp::dynamic_struct::Builder<'_>,
 ) -> capnp::Result<()> {
   let mut parser = Parser::new(json.chars());
-  let mut value = parser.parse_value()?;
+  let mut value = parser.parse_value(&codec.options, 0)?;
+  parser.discard_whitespace();
+  if parser.peek().is_some() {
+    return Err(capnp::Error::failed(
+      "Trailing characters after JSON value".into(),
+    ));
+  }
   let meta = EncodingOptions::default();
-  decode_struct(codec, &mut value, builder, &meta)
+  decode_struct(0, codec, &mut value, &mut Direct(builder), &meta)
+}
+
+/// Whether a JSON `null` here means "this field is absent".
+///
+/// A null pointer and an absent field are the same thing in Cap'n Proto, so
+/// for the pointer types a JSON `null` says the field was not set rather than
+/// that it holds an empty value. This mirrors `isPointerToJsonNull` in the C++
+/// codec, and the type list is the same one: Text, Data, List and Struct.
+///
+/// `Void` is deliberately not in that list even though it encodes as `null`:
+/// `null` is its *value*, and a void field decoded from `null` must be set,
+/// not skipped. C++ excludes it for the same reason.
+///
+/// This is a property of the field, not of the value alone, so it applies only
+/// where a field is being decoded. C++ likewise checks it in `decodeField` and
+/// not in `decodeArray`, so `null` remains an error as a list element.
+fn is_pointer_to_json_null(
+  value: &JsonValue,
+  field_type: &capnp::introspect::Type,
+) -> bool {
+  matches!(value, JsonValue::Null)
+    && matches!(
+      field_type.which(),
+      capnp::introspect::TypeVariant::Text
+        | capnp::introspect::TypeVariant::Data
+        | capnp::introspect::TypeVariant::List(_)
+        | capnp::introspect::TypeVariant::Struct(_)
+    )
+}
+
+/// Convert a JSON number to an integer, rejecting anything the target type
+/// cannot hold exactly.
+///
+/// JSON numbers are `f64`, so `300` is a perfectly well-formed JSON number to
+/// find in an `Int8` field, and `1.9` in an `Int32`. Converting with `as`
+/// would silently store 127 and 1 respectively and report success, turning
+/// malformed input into plausible-looking data.
+///
+/// The C++ codec rejects both, via three checks in `capnp/dynamic.c++`:
+/// `value >= MIN`, `value <= MAX`, and `T(value) == value`. Converting and
+/// converting back tests all three at once: Rust's float-to-integer `as`
+/// saturates, so anything outside the range comes back as the clamped bound,
+/// and any fractional part is lost — either way the round trip differs from
+/// the input. `NaN` and the infinities fail too, since neither survives the
+/// round trip.
+///
+/// This deliberately does not apply to floats or to enum ordinals, neither of
+/// which C++ range-checks: `1e300` into a `Float32` gives `inf` there and
+/// here.
+macro_rules! checked_int {
+  ($value:expr, $rust_ty:ty, $capnp_ty:literal, $field:expr) => {{
+    let value: f64 = $value;
+    let converted = value as $rust_ty;
+    if converted as f64 == value {
+      Ok(converted)
+    } else if value.trunc() == value {
+      Err(capnp::Error::failed(format!(
+        "Value {value} is out of range for {} field {}",
+        $capnp_ty, $field
+      )))
+    } else {
+      Err(capnp::Error::failed(format!(
+        "Value {value} is not an integer, required for {} field {}",
+        $capnp_ty, $field
+      )))
+    }
+  }};
 }
 
 fn decode_primitive<'json, 'meta>(
@@ -289,7 +460,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as i8).into())
+      Ok(checked_int!(*field_value, i8, "Int8", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::Int16 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -298,7 +469,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as i16).into())
+      Ok(checked_int!(*field_value, i16, "Int16", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::Int32 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -307,10 +478,12 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as i32).into())
+      Ok(checked_int!(*field_value, i32, "Int32", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::Int64 => match field_value {
-      JsonValue::Number(field_value) => Ok((*field_value as i64).into()),
+      JsonValue::Number(field_value) => {
+        Ok(checked_int!(*field_value, i64, "Int64", field_meta.name)?.into())
+      }
       JsonValue::String(field_value) => Ok(
         (field_value.parse::<i64>().map_err(|_| {
           capnp::Error::failed(format!(
@@ -332,7 +505,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as u8).into())
+      Ok(checked_int!(*field_value, u8, "UInt8", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::UInt16 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -341,7 +514,7 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as u16).into())
+      Ok(checked_int!(*field_value, u16, "UInt16", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::UInt32 => {
       let JsonValue::Number(field_value) = field_value else {
@@ -350,10 +523,12 @@ fn decode_primitive<'json, 'meta>(
           field_meta.name
         )));
       };
-      Ok((*field_value as u32).into())
+      Ok(checked_int!(*field_value, u32, "UInt32", field_meta.name)?.into())
     }
     capnp::introspect::TypeVariant::UInt64 => match field_value {
-      JsonValue::Number(field_value) => Ok((*field_value as u64).into()),
+      JsonValue::Number(field_value) => {
+        Ok(checked_int!(*field_value, u64, "UInt64", field_meta.name)?.into())
+      }
       JsonValue::String(field_value) => Ok(
         (field_value.parse::<u64>().map_err(|_| {
           capnp::Error::failed(format!(
@@ -370,6 +545,8 @@ fn decode_primitive<'json, 'meta>(
     },
     capnp::introspect::TypeVariant::Float32 => {
       let field_value = match field_value {
+        // C++ decodes a JSON null into a float as NaN.
+        JsonValue::Null => f32::NAN,
         JsonValue::Number(field_value) => *field_value as f32,
         JsonValue::String(field_value) => match field_value.as_str() {
           "NaN" => f32::NAN,
@@ -393,6 +570,8 @@ fn decode_primitive<'json, 'meta>(
     }
     capnp::introspect::TypeVariant::Float64 => {
       let field_value = match field_value {
+        // C++ decodes a JSON null into a float as NaN.
+        JsonValue::Null => f64::NAN,
         JsonValue::Number(field_value) => *field_value,
         JsonValue::String(field_value) => match field_value.as_str() {
           "NaN" => f64::NAN,
@@ -492,7 +671,13 @@ fn decode_primitive<'json, 'meta>(
               field_meta.name
             )));
           };
-          data.push(byte_value as u8);
+          // C++: "Number in byte array is not an integer in [0, 255]".
+          data.push(checked_int!(
+            byte_value,
+            u8,
+            "Data byte in",
+            field_meta.name
+          )?);
         }
         *field_value = JsonValue::DataBuffer(data);
         Ok(capnp::dynamic_value::Reader::Data(match field_value {
@@ -534,7 +719,86 @@ fn decode_primitive<'json, 'meta>(
   }
 }
 
+/// Where a decoded struct's fields get written.
+///
+/// A flattened struct shares its parent's JSON object rather than occupying a
+/// key of its own, so whether it is present at all is not known until one of
+/// its members turns up. Writing through a sink defers creating it until that
+/// happens: a flattened field the JSON never mentions is never touched, and
+/// writing into a nested one creates its parents in turn.
+trait StructSink {
+  /// The schema being decoded into. Answering this must not create anything,
+  /// since it is needed before we know whether there is anything to write.
+  fn schema(&self) -> capnp::schema::StructSchema;
+
+  /// The builder to write into, creating the struct if this is the first
+  /// write. Only call this once you know a field is actually being written —
+  /// calling it to "get the builder" up front reintroduces the eager
+  /// creation this exists to avoid.
+  fn builder(&mut self) -> capnp::Result<capnp::dynamic_struct::Builder<'_>>;
+}
+
+/// A struct that already exists: the message root, a non-flattened field the
+/// JSON named, or a list element.
+struct Direct<'a>(capnp::dynamic_struct::Builder<'a>);
+
+impl StructSink for Direct<'_> {
+  fn schema(&self) -> capnp::schema::StructSchema {
+    self.0.get_schema()
+  }
+
+  fn builder(&mut self) -> capnp::Result<capnp::dynamic_struct::Builder<'_>> {
+    Ok(self.0.reborrow())
+  }
+}
+
+/// A flattened field, created on first write.
+struct Flattened<'p> {
+  parent:  &'p mut dyn StructSink,
+  field:   capnp::schema::Field,
+  schema:  capnp::schema::StructSchema,
+  created: bool,
+}
+
+impl StructSink for Flattened<'_> {
+  fn schema(&self) -> capnp::schema::StructSchema {
+    self.schema
+  }
+
+  fn builder(&mut self) -> capnp::Result<capnp::dynamic_struct::Builder<'_>> {
+    let first = !self.created;
+    self.created = true;
+
+    // Deriving the child from the parent again on every write, rather than
+    // caching it, is deliberate: `parent.builder()` borrows from `&mut self`,
+    // so the result cannot be stored for `'a`. It is cheap — after the first
+    // call the pointer is non-null, so `get` is just pointer arithmetic.
+    let parent = self.parent.builder()?;
+
+    // `get` merges: for a group it reinterprets the parent's own builder, and
+    // for a struct field it allocates only while the pointer is still null.
+    // `init` would instead discard whatever is already there, and for a group
+    // would clear it.
+    //
+    // Union members are the exception. `get` does not set the discriminant,
+    // so the member has to be activated once with `init`; doing that on every
+    // write would clear the fields written before it.
+    let value = if first && is_union_member(self.field) {
+      parent.init(self.field)?
+    } else {
+      parent.get(self.field)?
+    };
+    Ok(value.downcast::<capnp::dynamic_struct::Builder>())
+  }
+}
+
+fn is_union_member(field: capnp::schema::Field) -> bool {
+  field.get_proto().get_discriminant_value()
+    != capnp::schema_capnp::field::NO_DISCRIMINANT
+}
+
 fn decode_list(
+  recursion_level: usize,
   codec: &super::Codec,
   mut field_values: Vec<JsonValue>,
   mut list_builder: capnp::dynamic_list::Builder,
@@ -547,7 +811,13 @@ fn decode_list(
           .reborrow()
           .get(i as u32)?
           .downcast::<capnp::dynamic_struct::Builder>();
-        decode_struct(codec, &mut item_value, struct_builder, field_meta)?;
+        decode_struct(
+          recursion_level + 1,
+          codec,
+          &mut item_value,
+          &mut Direct(struct_builder),
+          field_meta,
+        )?;
       }
       Ok(())
     }
@@ -563,7 +833,13 @@ fn decode_list(
           .reborrow()
           .init(i as u32, item_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
-        decode_list(codec, item_value, sub_element_builder, field_meta)?;
+        decode_list(
+          recursion_level + 1,
+          codec,
+          item_value,
+          sub_element_builder,
+          field_meta,
+        )?;
       }
       Ok(())
     }
@@ -584,11 +860,18 @@ fn decode_list(
 }
 
 fn decode_struct(
+  recursion_level: usize,
   codec: &super::Codec,
   value: &mut JsonValue,
-  mut builder: capnp::dynamic_struct::Builder<'_>,
+  sink: &mut dyn StructSink,
   meta: &EncodingOptions,
 ) -> capnp::Result<()> {
+  if recursion_level > codec.options.recursion_limit {
+    return Err(capnp::Error::failed(
+      "Recursion limit exceeded while decoding JSON".into(),
+    ));
+  }
+
   let field_prefix = if let Some(flatten_options) = &meta.flatten {
     std::borrow::Cow::Owned(format!(
       "{}{}",
@@ -599,8 +882,8 @@ fn decode_struct(
     std::borrow::Cow::Borrowed("")
   };
 
-  if let Some(field_codec) = builder
-    .get_schema()
+  if let Some(field_codec) = sink
+    .schema()
     .get_annotations()?
     .iter()
     .find(|a| a.get_id() == rust_json_capnp::codec::ID)
@@ -610,13 +893,14 @@ fn decode_struct(
       .downcast::<capnp::text::Reader>()
       .to_str()?;
     if let Some(field_codec) = codec.registry.get(field_codec) {
-      return field_codec.decode_value(value, builder.reborrow().into());
+      return field_codec.decode_value(value, sink.builder()?.into());
     }
   }
 
   fn decode_member(
+    recursion_level: usize,
     codec: &super::Codec,
-    mut builder: capnp::dynamic_struct::Builder<'_>,
+    sink: &mut dyn StructSink,
     field: capnp::schema::Field,
     field_meta: &EncodingOptions,
     value: &mut JsonValue,
@@ -644,51 +928,69 @@ fn decode_struct(
         Some(v) => v,
         None => return Ok(()),
       };
-      return field_codec.decode_member(
-        &field_value,
-        builder.reborrow(),
-        field,
-      );
+      return field_codec.decode_member(&field_value, sink.builder()?, field);
     }
 
     match field.get_type().which() {
-      capnp::introspect::TypeVariant::Struct(_struct_schema) => {
+      capnp::introspect::TypeVariant::Struct(struct_schema) => {
         if field_meta.flatten.is_none() {
           let mut field_value = match obj.remove(value_name) {
             Some(v) => v,
             None => return Ok(()),
           };
+          if is_pointer_to_json_null(&field_value, &field.get_type()) {
+            return Ok(());
+          }
 
-          let struct_builder = builder
-            .reborrow()
+          // The JSON named this field, so creating it is right. `init`
+          // replaces rather than merges, matching what C++ does for a field
+          // that is present.
+          let struct_builder = sink
+            .builder()?
             .init(field)?
             .downcast::<capnp::dynamic_struct::Builder>();
 
-          decode_struct(codec, &mut field_value, struct_builder, field_meta)?;
+          decode_struct(
+            recursion_level + 1,
+            codec,
+            &mut field_value,
+            &mut Direct(struct_builder),
+            field_meta,
+          )?;
         } else {
-          //
-          // FIXME: We should only init this struct if any field is
-          // found in decode_struct. For now, we always init it.
-          // To do that we would need to get decode_struct to actually
-          // take the builder+field, or a callback to init it.
-          //
-          // The current implementation results in has_<field>()
-          // returning true even if all fields are missing in the
-          // JSON.
-          //
-          let struct_builder = builder
-            .reborrow()
-            .init(field)?
-            .downcast::<capnp::dynamic_struct::Builder>();
-
+          // A flattened struct has no key of its own, so nothing is created
+          // here; the sink does it if and when a member is actually written.
+          let mut flattened = Flattened {
+            parent: sink,
+            field,
+            schema: capnp::schema::StructSchema::new(struct_schema),
+            created: false,
+          };
+          if is_union_member(field) {
+            // Except when it is a union member. Reaching here means the
+            // variant was already chosen, possibly by a discriminator tag
+            // alone, and choosing it has to activate it whether or not any of
+            // its own members appear. C++ does the same, activating with
+            // `clear()` before decoding into it.
+            flattened.builder()?;
+          }
           // Flattened struct; pass the JsonValue at this level down
-          decode_struct(codec, value, struct_builder, field_meta)?;
+          decode_struct(
+            recursion_level + 1,
+            codec,
+            value,
+            &mut flattened,
+            field_meta,
+          )?;
         }
       }
       capnp::introspect::TypeVariant::List(_element_type) => {
         let Some(field_value) = obj.remove(value_name) else {
           return Ok(());
         };
+        if is_pointer_to_json_null(&field_value, &field.get_type()) {
+          return Ok(());
+        }
 
         let JsonValue::Array(field_value) = field_value else {
           return Err(capnp::Error::failed(format!(
@@ -696,45 +998,58 @@ fn decode_struct(
             field_meta.name
           )));
         };
-        let list_builder = builder
-          .reborrow()
+        let list_builder = sink
+          .builder()?
           .initn(field, field_value.len() as u32)?
           .downcast::<capnp::dynamic_list::Builder>();
-        decode_list(codec, field_value, list_builder, field_meta)?;
+        decode_list(
+          recursion_level,
+          codec,
+          field_value,
+          list_builder,
+          field_meta,
+        )?;
       }
 
       capnp::introspect::TypeVariant::AnyPointer => {
-        return Err(capnp::Error::unimplemented(
-          "AnyPointer cannot be represented in JSON".into(),
-        ));
+        if obj.remove(value_name).is_some() {
+          return Err(capnp::Error::unimplemented(
+            "AnyPointer cannot be represented in JSON".into(),
+          ));
+        }
       }
       capnp::introspect::TypeVariant::Capability => {
-        return Err(capnp::Error::unimplemented(
-          "Capability cannot be represented in JSON".into(),
-        ));
+        if obj.remove(value_name).is_some() {
+          return Err(capnp::Error::unimplemented(
+            "Capability cannot be represented in JSON".into(),
+          ));
+        }
       }
 
       _ => {
         let Some(mut field_value) = obj.remove(value_name) else {
           return Ok(());
         };
+        if is_pointer_to_json_null(&field_value, &field.get_type()) {
+          return Ok(());
+        }
 
-        builder.set(
-          field,
-          decode_primitive(&mut field_value, &field.get_type(), field_meta)?,
-        )?;
+        let value =
+          decode_primitive(&mut field_value, &field.get_type(), field_meta)?;
+        sink.builder()?.set(field, value)?;
       }
     }
     Ok(())
   }
 
-  for field in builder.get_schema().get_non_union_fields()? {
+  for field in sink.schema().get_non_union_fields()? {
     let field_meta = EncodingOptions::from_field(&field_prefix, field)?;
     let field_name = format!("{}{}", field_prefix, field_meta.name);
 
     decode_member(
+      recursion_level,
       codec,
-      builder.reborrow(),
+      sink,
       field,
       &field_meta,
       value,
@@ -748,8 +1063,8 @@ fn decode_struct(
     ));
   };
 
-  let struct_discriminator = builder
-    .get_schema()
+  let struct_discriminator = sink
+    .schema()
     .get_annotations()?
     .iter()
     .find(|a| a.get_id() == json_capnp::discriminator::ID)
@@ -785,7 +1100,7 @@ fn decode_struct(
     None => {
       // find the first field that exists matching a union field?
       let mut discriminant = None;
-      for field in builder.get_schema().get_union_fields()? {
+      for field in sink.schema().get_union_fields()? {
         let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
         let field_name = format!("{}{}", field_prefix, field_meta.name);
         if obj.contains_key(&field_name) {
@@ -798,7 +1113,7 @@ fn decode_struct(
   };
 
   if let Some(discriminant) = discriminant {
-    for field in builder.get_schema().get_union_fields()? {
+    for field in sink.schema().get_union_fields()? {
       let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
       if field_meta.name != discriminant {
         continue;
@@ -817,14 +1132,15 @@ fn decode_struct(
         capnp::introspect::TypeVariant::Void
       ) {
         // Void union member; just set the discriminant
-        builder
-          .reborrow()
+        sink
+          .builder()?
           .set(field, capnp::dynamic_value::Reader::Void)?;
         break;
       }
       decode_member(
+        recursion_level,
         codec,
-        builder.reborrow(),
+        sink,
         field,
         &field_meta,
         value,
@@ -845,7 +1161,7 @@ mod test {
     let json = r#""Hello, World!""#;
 
     let mut parser = Parser::new(json.chars());
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
 
     assert!(matches!(value, JsonValue::String(s) if s == "Hello, World!"));
     Ok(())
@@ -856,7 +1172,7 @@ mod test {
     let json = r#""Hełło,\nWorld!\"†ęś†: \u0007""#;
 
     let mut parser = Parser::new(json.chars());
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
 
     assert!(
       matches!(value, JsonValue::String(s) if s == "Hełło,\nWorld!\"†ęś†: \u{0007}")
@@ -864,7 +1180,7 @@ mod test {
 
     let json = r#"{"value":"tab: \t, newline: \n, carriage return: \r, quote: \", backslash: \\"}"#;
     let mut parser = Parser::new(json.chars());
-    let value = parser.parse_value()?;
+    let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
     let JsonValue::Object(map) = value else {
       panic!("Expected object at top level");
     };

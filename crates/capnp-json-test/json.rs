@@ -19,11 +19,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-#[cfg(test)]
+// Not `#[cfg(test)]`: the benchmarks in `benches/` are a separate compilation
+// unit and need the generated types too.
 capnp::generated_code!(pub mod test_capnp);
-#[cfg(test)]
 capnp::generated_code!(pub mod json_test_capnp);
-#[cfg(test)]
 capnp::generated_code!(pub mod test_compat_capnp);
 
 mod cppcompat;
@@ -1072,6 +1071,26 @@ mod tests {
   }
 
   #[test]
+  fn any_pointer_null_does_not_prevent_encoding() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    let json = json::to_json(root.reborrow_as_reader())?;
+    assert_eq!(r#"{}"#, json);
+    Ok(())
+  }
+
+  #[test]
+  fn any_pointer_null_does_not_prevent_decoding() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    json::from_json(r#"{}"#, root.reborrow())?;
+    assert!(root.get_any_pointer_field().is_null());
+    Ok(())
+  }
+
+  #[test]
   fn custom_codec_encode() -> capnp::Result<()> {
     let mut msg = capnp::message::Builder::new_default();
     let mut root = msg.init_root::<crate::json_test_capnp::struct_with_custom_codec::Builder<'_>>();
@@ -1084,7 +1103,7 @@ mod tests {
         "TestCodec",
         json::make_field_codec(
           |_value| {
-            let mut v = std::collections::HashMap::new();
+            let mut v = std::collections::BTreeMap::new();
             v.insert("test".to_string(), JsonValue::String("Inside".into()));
             Ok(JsonValue::Object(v))
           },
@@ -1194,7 +1213,7 @@ mod tests {
         "TestCodec",
         json::make_field_codec(
           |_value| {
-            let mut v = std::collections::HashMap::new();
+            let mut v = std::collections::BTreeMap::new();
             v.insert("test".to_string(), JsonValue::String("Inside".into()));
             Ok(JsonValue::Object(v))
           },
@@ -1304,7 +1323,7 @@ mod tests {
       a_group_field.get_type(),
       json::make_field_codec(
         |_reader| {
-          let v = std::collections::HashMap::from([(
+          let v = std::collections::BTreeMap::from([(
             "aGroup".to_string(),
             JsonValue::String("Overridden".into()),
           )]);
@@ -1346,7 +1365,7 @@ mod tests {
       a_group_field.get_type(),
       json::make_field_codec(
         |_reader| {
-          let v = std::collections::HashMap::from([(
+          let v = std::collections::BTreeMap::from([(
             "aGroup".to_string(),
             JsonValue::String("Overridden".into()),
           )]);
@@ -1368,6 +1387,1085 @@ mod tests {
     let reader = root.reborrow_as_reader();
     assert_eq!("Overridden", reader.get_a_group().get_flat_bar()?.to_str()?);
 
+    Ok(())
+  }
+
+  #[test]
+  fn recursion_level_limit() -> capnp::Result<()> {
+    let codec = json::Codec::new_with_options(json::CodecOptions {
+      recursion_limit: 2,
+      ..Default::default()
+    });
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+
+    let json = r#"{"anyPointerField":[[["too deep"]]]}"#;
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+
+    let json = r#"{"anyPointerField":{"anyPointerField":{"anyPointerField":"too deep"}}}"#;
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+
+    let json = r#"{"anyPointerField":[{"anyPointerField":{"anyPointerField":"too deep"}}]}"#;
+    let result = codec.decode(json, root.reborrow());
+    let Err(e) = result else {
+      panic!("Expected error");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+
+    Ok(())
+  }
+
+  // ---------------------------------------------------------------------
+  // Recursion limits
+  //
+  // Two independent limits guard against unbounded recursion while decoding:
+  // the parser's, which bounds the depth of the `JsonValue` tree it builds,
+  // and `decode_struct`'s, which bounds how deep the schema walk descends.
+  // The second is not redundant: a struct that flattens a field of its own
+  // type recurses on the schema without descending into the JSON at all, so
+  // the parser's limit can never fire for it.
+  // ---------------------------------------------------------------------
+
+  /// The default matches the C++ codec's `maxNestingDepth`.
+  #[test]
+  fn recursion_limit_default_matches_cpp() {
+    assert_eq!(json::CodecOptions::default().recursion_limit, 64);
+  }
+
+  /// Nesting one JSON object per schema level: the boundary is exact, and
+  /// input one level inside it still decodes correctly.
+  #[test]
+  fn recursion_limit_object_nesting_boundary() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_struct;
+
+    fn nested(depth: usize) -> String {
+      let mut s = String::new();
+      for _ in 0..depth {
+        s.push_str(r#"{"inner":"#);
+      }
+      s.push_str(r#"{"value":7}"#);
+      for _ in 0..depth {
+        s.push('}');
+      }
+      s
+    }
+
+    let codec = json::Codec::new();
+    let limit = json::CodecOptions::default().recursion_limit;
+
+    // `nested(d)` writes d `{"inner":` wrappers around a `{"value":7}` leaf,
+    // so it contains d + 1 objects in total. A `recursion_limit` of N admits
+    // N nested containers, which is exactly what `capnp convert` accepts at
+    // the same setting: 64 objects through, 65 rejected.
+    let deepest_accepted = limit - 1;
+
+    // At the limit: accepted, and the value at the bottom survives.
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<self_struct::Builder<'_>>();
+    codec.decode(&nested(deepest_accepted), root.reborrow())?;
+    let mut cursor = root.reborrow_as_reader();
+    for _ in 0..deepest_accepted {
+      cursor = cursor.get_inner()?;
+    }
+    assert_eq!(cursor.get_value(), 7, "value at the bottom must survive");
+
+    // One past it: rejected rather than overflowing the stack.
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<self_struct::Builder<'_>>();
+    let Err(e) = codec.decode(&nested(deepest_accepted + 1), root) else {
+      panic!("expected the recursion limit to reject this");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert!(
+      e.extra.contains("Recursion limit exceeded"),
+      "unexpected error: {}",
+      e.extra
+    );
+    Ok(())
+  }
+
+  /// `validate_schema` reports cyclic flattening the way the C++ codec does.
+  /// `$Json.flatten` splices members into the parent object rather than
+  /// nesting them, so a cycle of flattened fields describes an object of
+  /// infinite width.
+  ///
+  /// It is a property of the schema, not of the data, so it holds for a type
+  /// nothing has been written to.
+  #[test]
+  fn validate_schema_reports_cyclic_flattening() {
+    use crate::json_test_capnp::cyclic_flatten;
+
+    let Err(e) = json::validate_schema::<cyclic_flatten::Owned>() else {
+      panic!("expected cyclic flattening to be reported");
+    };
+    assert_eq!(e.kind, capnp::ErrorKind::Failed);
+    assert!(
+      e.extra.starts_with("cyclic JSON flattening detected"),
+      "unexpected error: {}",
+      e.extra
+    );
+  }
+
+  /// Encoding and decoding do not run the schema check, so a cyclic schema is
+  /// not reported as such there. It is still rejected on decode -- by the
+  /// recursion limit, which is what guarantees decoding terminates -- just
+  /// with a message about depth rather than about the cycle.
+  #[test]
+  fn cyclic_flatten_is_not_checked_by_decode() {
+    use crate::json_test_capnp::cyclic_flatten;
+
+    for json in [r#"{}"#, r#"{"value":1}"#, r#"{"i.value":1}"#] {
+      let mut builder = capnp::message::Builder::new_default();
+      let root = builder.init_root::<cyclic_flatten::Builder<'_>>();
+      let Err(e) = json::Codec::new().decode(json, root) else {
+        panic!("expected {json} to be rejected");
+      };
+      assert_eq!(e.kind, capnp::ErrorKind::Failed);
+      assert_eq!(e.extra, "Recursion limit exceeded while decoding JSON");
+    }
+  }
+
+  /// Encoding a cyclic schema terminates on its own: an unset pointer field is
+  /// skipped rather than descended into, so there is nothing for the check to
+  /// save us from here.
+  #[test]
+  fn cyclic_flatten_encodes() -> capnp::Result<()> {
+    use crate::json_test_capnp::cyclic_flatten;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<cyclic_flatten::Builder<'_>>();
+    root.set_value(1);
+    assert_eq!(json::to_json(root.reborrow_as_reader())?, r#"{"value":1}"#);
+
+    root.reborrow().init_inner().set_value(2);
+    assert_eq!(
+      json::to_json(root.reborrow_as_reader())?,
+      r#"{"i.value":2,"value":1}"#
+    );
+    Ok(())
+  }
+
+  /// Which schemas count as cyclic, checked against the verdict `capnp
+  /// convert` gives for each shape.
+  #[test]
+  fn cyclic_flatten_matches_cpp_verdicts() -> capnp::Result<()> {
+    use crate::json_test_capnp::{
+      cyclic_flatten,
+      flatten_through_group,
+      mutual_flatten_a,
+      mutual_one_flat_a,
+      references_cyclic,
+      references_cyclic_via_list,
+      self_struct,
+    };
+
+    // Cyclic: a struct flattening its own type.
+    assert!(json::validate_schema::<cyclic_flatten::Owned>().is_err());
+    // Cyclic: a group is an edge even when it is not itself flattened.
+    assert!(json::validate_schema::<flatten_through_group::Owned>().is_err());
+    // Cyclic: A -> B -> A, both flattened.
+    assert!(json::validate_schema::<mutual_flatten_a::Owned>().is_err());
+    // Cyclic: reachable through a plain field, and through a list element
+    // type. C++ loads handlers for the whole dependency graph, so these are
+    // rejected even though the root itself flattens nothing.
+    assert!(json::validate_schema::<references_cyclic::Owned>().is_err());
+    assert!(
+      json::validate_schema::<references_cyclic_via_list::Owned>().is_err()
+    );
+
+    // Not cyclic: the return edge is a plain field, so it nests and
+    // flattening terminates.
+    json::validate_schema::<mutual_one_flat_a::Owned>()?;
+    // Not cyclic: plain self-reference without any flattening.
+    json::validate_schema::<self_struct::Owned>()?;
+    Ok(())
+  }
+
+  /// The check must not be over-eager: the schemas this crate exercises
+  /// everywhere else flatten legitimately and must all pass.
+  #[test]
+  fn validate_schema_accepts_ordinary_schemas() -> capnp::Result<()> {
+    use crate::test_capnp::{
+      test_json_flatten_union,
+      test_json_types,
+      test_union,
+      test_unnamed_union,
+    };
+
+    json::validate_schema::<test_json_types::Owned>()?;
+    json::validate_schema::<test_json_flatten_union::Owned>()?;
+    json::validate_schema::<test_union::Owned>()?;
+    json::validate_schema::<test_unnamed_union::Owned>()?;
+    json::validate_schema::<test_json_annotations::Owned>()?;
+    Ok(())
+  }
+
+  /// A schema that flattens without cycling still works, so the check has not
+  /// simply banned flattening.
+  #[test]
+  fn non_cyclic_flatten_still_round_trips() -> capnp::Result<()> {
+    use crate::json_test_capnp::mutual_one_flat_a;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<mutual_one_flat_a::Builder<'_>>();
+    root.set_value(9);
+    {
+      let mut b = root.reborrow().init_b();
+      b.set_other(4);
+      b.reborrow().init_a().set_value(3);
+    }
+    let encoded = json::to_json(root.reborrow_as_reader())?;
+    assert_eq!(encoded, r#"{"a":{"value":3},"other":4,"value":9}"#);
+
+    let mut rt = capnp::message::Builder::new_default();
+    let mut rt_root = rt.init_root::<mutual_one_flat_a::Builder<'_>>();
+    json::Codec::new().decode(&encoded, rt_root.reborrow())?;
+
+    let r = rt_root.reborrow_as_reader();
+    assert_eq!(r.get_value(), 9);
+    assert_eq!(r.get_b()?.get_other(), 4);
+    assert_eq!(r.get_b()?.get_a()?.get_value(), 3);
+
+    // Re-encoding reproduces the input byte-for-byte. It did not always: a
+    // flattened field used to be created whether or not the JSON named it, so
+    // the inner `a`'s own flattened `b` sprang into existence during the
+    // decode and its members reappeared on the way out.
+    assert_eq!(
+      json::to_json(rt_root.reborrow_as_reader())?,
+      encoded,
+      "a flattened field the JSON never mentioned must not be created"
+    );
+    Ok(())
+  }
+
+  /// Self-reference through `List(Struct)`, which alternates arrays and
+  /// objects. Bounded, and legal input inside the limit still round-trips.
+  #[test]
+  fn recursion_limit_list_of_structs() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_list;
+
+    fn nested(depth: usize) -> String {
+      let mut s = String::new();
+      for _ in 0..depth {
+        s.push_str(r#"{"children":["#);
+      }
+      s.push_str(r#"{"value":7}"#);
+      for _ in 0..depth {
+        s.push_str("]}");
+      }
+      s
+    }
+
+    let codec = json::Codec::new();
+
+    // Comfortably inside the limit: decodes, and the leaf survives.
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<self_list::Builder<'_>>();
+    codec.decode(&nested(20), root.reborrow())?;
+    let mut cursor = root.reborrow_as_reader();
+    for _ in 0..20 {
+      cursor = cursor.get_children()?.get(0);
+    }
+    assert_eq!(cursor.get_value(), 7);
+
+    // Far outside it: an error, not a stack overflow.
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<self_list::Builder<'_>>();
+    // 100 levels is 200 JSON containers, comfortably past the limit of 64,
+    // and cheap enough for miri.
+    let far_past_limit = if cfg!(miri) { 100 } else { 500 };
+    let Err(e) = codec.decode(&nested(far_past_limit), root) else {
+      panic!("expected the recursion limit to reject this");
+    };
+    assert!(
+      e.extra.contains("Recursion limit exceeded"),
+      "unexpected error: {}",
+      e.extra
+    );
+    Ok(())
+  }
+
+  /// Nested lists, which recurse through `decode_list` rather than
+  /// `decode_struct`.
+  #[test]
+  fn recursion_limit_nested_lists() -> capnp::Result<()> {
+    use crate::test_capnp::test_complex_list;
+
+    let depth = if cfg!(miri) { 100 } else { 500 };
+    let mut json = String::from(r#"{"primListListList":"#);
+    for _ in 0..depth {
+      json.push('[');
+    }
+    for _ in 0..depth {
+      json.push(']');
+    }
+    json.push('}');
+
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<test_complex_list::Builder<'_>>();
+    let Err(e) = json::Codec::new().decode(&json, root) else {
+      panic!("expected the recursion limit to reject this");
+    };
+    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    Ok(())
+  }
+
+  /// A hostile payload that is nothing but nesting must be rejected quickly
+  /// rather than aborting the process. This is the case that motivated the
+  /// limit; before it existed this test crashed the whole test binary.
+  #[test]
+  fn deeply_nested_hostile_input_does_not_abort() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_struct;
+
+    // Miri interprets every character of the parse, so the huge sizes take
+    // far too long there. The limit fires at 64, so 1_000 already proves the
+    // point; the larger sizes exist to show the cost stays bounded.
+    const DEPTHS: &[usize] = if cfg!(miri) {
+      &[1_000]
+    } else {
+      &[1_000, 100_000, 1_000_000]
+    };
+
+    for &depth in DEPTHS {
+      let mut json = String::from(r#"{"inner":"#);
+      for _ in 0..depth {
+        json.push('[');
+      }
+      let mut builder = capnp::message::Builder::new_default();
+      let root = builder.init_root::<self_struct::Builder<'_>>();
+      let Err(e) = json::Codec::new().decode(&json, root) else {
+        panic!("expected depth {depth} to be rejected");
+      };
+      assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    }
+    Ok(())
+  }
+
+  /// The limit is configurable in both directions.
+  #[test]
+  fn recursion_limit_is_configurable() -> capnp::Result<()> {
+    use crate::json_test_capnp::self_struct;
+
+    let json = r#"{"inner":{"inner":{"value":7}}}"#;
+
+    // Three levels of object nesting; a limit of 2 rejects it.
+    let codec = json::Codec::new_with_options(json::CodecOptions {
+      recursion_limit: 2,
+      ..Default::default()
+    });
+    let mut builder = capnp::message::Builder::new_default();
+    let root = builder.init_root::<self_struct::Builder<'_>>();
+    assert!(codec.decode(json, root).is_err());
+
+    // A limit of 8 accepts it.
+    let codec = json::Codec::new_with_options(json::CodecOptions {
+      recursion_limit: 8,
+      ..Default::default()
+    });
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder.init_root::<self_struct::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+    assert_eq!(
+      root
+        .reborrow_as_reader()
+        .get_inner()?
+        .get_inner()?
+        .get_value(),
+      7
+    );
+    Ok(())
+  }
+
+  /// `to_json` and `from_json` share one cached codec per thread rather than
+  /// building one per call, so exercise them from several threads at once:
+  /// each thread must warm its own cache and produce the same answer.
+  #[test]
+  fn convenience_api_is_usable_from_many_threads() {
+    use crate::test_capnp::test_json_types;
+
+    let expected = {
+      let mut builder = message::Builder::new_default();
+      let mut root: test_json_types::Builder<'_> = builder.init_root();
+      root.set_int8_field(-8);
+      root.set_text_field("hello");
+      json::to_json(root.reborrow_as_reader()).unwrap()
+    };
+
+    let (workers, iterations) = if cfg!(miri) { (2, 5) } else { (8, 200) };
+    let threads: Vec<_> = (0..workers)
+      .map(|_| {
+        let expected = expected.clone();
+        std::thread::spawn(move || {
+          for _ in 0..iterations {
+            let mut builder = message::Builder::new_default();
+            let mut root: test_json_types::Builder<'_> = builder.init_root();
+            root.set_int8_field(-8);
+            root.set_text_field("hello");
+            assert_eq!(
+              json::to_json(root.reborrow_as_reader()).unwrap(),
+              expected
+            );
+
+            let mut rt = message::Builder::new_default();
+            let mut rt_root: test_json_types::Builder<'_> = rt.init_root();
+            json::from_json(&expected, rt_root.reborrow()).unwrap();
+            assert_eq!(rt_root.reborrow_as_reader().get_int8_field(), -8);
+          }
+        })
+      })
+      .collect();
+
+    for t in threads {
+      t.join().expect("worker thread panicked");
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Integer range checking
+  //
+  // JSON numbers are f64, so out-of-range and fractional values are
+  // well-formed JSON that the target type cannot hold. Converting with `as`
+  // saturates and truncates silently, turning bad input into plausible data.
+  // Every expectation below is the verdict `capnp convert json:text` gives
+  // for the same input.
+  // -------------------------------------------------------------------
+
+  /// Values outside the target type's range are rejected, not clamped.
+  #[test]
+  fn out_of_range_integers_are_rejected() {
+    use crate::test_capnp::test_json_types;
+
+    // (json, the value `as` would have silently stored)
+    let cases = [
+      (r#"{"int8Field":300}"#, "127"),
+      (r#"{"int8Field":-200}"#, "-128"),
+      (r#"{"int16Field":40000}"#, "32767"),
+      (r#"{"int32Field":1e300}"#, "2147483647"),
+      (r#"{"uInt8Field":-5}"#, "0"),
+      (r#"{"uInt8Field":256}"#, "255"),
+      (r#"{"uInt32Field":-1}"#, "0"),
+      (r#"{"int64Field":1e300}"#, "i64::MAX"),
+      (r#"{"uInt64Field":-1}"#, "0"),
+    ];
+
+    for (json, would_have_stored) in cases {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(json, root) else {
+        panic!(
+          "{json} must be rejected, not silently stored as {would_have_stored}"
+        );
+      };
+      assert_eq!(e.kind, capnp::ErrorKind::Failed);
+      assert!(
+        e.extra.contains("out of range"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+  }
+
+  /// Numbers with a fractional part are rejected for integer fields; C++
+  /// makes the same check (`T(value) == value`).
+  #[test]
+  fn fractional_numbers_are_rejected_for_integers() {
+    use crate::test_capnp::test_json_types;
+
+    for json in [
+      r#"{"int32Field":1.9}"#,
+      r#"{"int32Field":-1.9}"#,
+      r#"{"uInt8Field":0.5}"#,
+      r#"{"int64Field":1.5}"#,
+    ] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(json, root) else {
+        panic!("{json} must be rejected rather than truncated");
+      };
+      assert!(
+        e.extra.contains("is not an integer"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+  }
+
+  /// The boundary values themselves must still be accepted.
+  #[test]
+  fn in_range_integers_are_accepted() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = concat!(
+      r#"{"int8Field":-128,"int16Field":32767,"int32Field":-2147483648,"#,
+      r#""uInt8Field":255,"uInt16Field":65535,"uInt32Field":4294967295,"#,
+      r#""int64Field":"-9223372036854775808","#,
+      r#""uInt64Field":"18446744073709551615","#,
+      r#""float64Field":2.5}"#
+    );
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(json, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert_eq!(r.get_int8_field(), i8::MIN);
+    assert_eq!(r.get_int16_field(), i16::MAX);
+    assert_eq!(r.get_int32_field(), i32::MIN);
+    assert_eq!(r.get_u_int8_field(), u8::MAX);
+    assert_eq!(r.get_u_int16_field(), u16::MAX);
+    assert_eq!(r.get_u_int32_field(), u32::MAX);
+    assert_eq!(r.get_int64_field(), i64::MIN);
+    assert_eq!(r.get_u_int64_field(), u64::MAX);
+    // Whole-valued floats stay acceptable for float fields.
+    assert_eq!(r.get_float64_field(), 2.5);
+    Ok(())
+  }
+
+  /// Data is a byte array, so each element must be an integer in [0, 255].
+  ///
+  /// We are deliberately stricter than the C++ codec on the upper bound. C++
+  /// checks `byte(x) == x`, whose out-of-range `double` -> `byte` conversion
+  /// is undefined behaviour; in practice it lets 256, 300 and 511 through and
+  /// stores them modulo 256 (300 becomes 44), while correctly rejecting -5 and
+  /// 1.5. Its own message -- "Number in byte array is not an integer in
+  /// [0, 255]" -- says what it meant to do, and that is what we enforce. This
+  /// cannot break round-tripping, because the C++ encoder never emits a byte
+  /// outside [0, 255] in the first place.
+  #[test]
+  fn data_bytes_are_range_checked() {
+    use crate::test_capnp::test_blob;
+
+    for json in [
+      r#"{"dataField":[300]}"#,
+      r#"{"dataField":[-5]}"#,
+      r#"{"dataField":[256]}"#,
+      r#"{"dataField":[1.5]}"#,
+    ] {
+      let mut builder = message::Builder::new_default();
+      let root: test_blob::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(json, root) else {
+        panic!("{json} must be rejected; bytes outside [0, 255] are not data");
+      };
+      assert!(
+        e.extra.contains("Data byte"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+
+    // The full byte range still round-trips.
+    let mut builder = message::Builder::new_default();
+    let mut root: test_blob::Builder<'_> = builder.init_root();
+    json::from_json(r#"{"dataField":[0,127,255]}"#, root.reborrow()).unwrap();
+    assert_eq!(
+      root.reborrow_as_reader().get_data_field().unwrap(),
+      &[0u8, 127, 255]
+    );
+  }
+
+  /// Floats are deliberately *not* range-checked, matching C++: an
+  /// out-of-range value saturates to an infinity rather than erroring.
+  #[test]
+  fn floats_are_not_range_checked() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(r#"{"float32Field":1e300}"#, root.reborrow())?;
+    assert!(root.reborrow_as_reader().get_float32_field().is_infinite());
+    Ok(())
+  }
+
+  /// The string spellings of the non-finite floats are for float fields only.
+  /// They must not decode into an integer field, where `as` would have turned
+  /// them into 0 and `i32::MAX`.
+  #[test]
+  fn non_finite_strings_are_rejected_for_integers() {
+    use crate::test_capnp::test_json_types;
+
+    for json in [r#"{"int32Field":"NaN"}"#, r#"{"int32Field":"Infinity"}"#] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      assert!(
+        json::from_json(json, root).is_err(),
+        "{json} must not decode to an integer"
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // JSON null for pointer-typed fields
+  //
+  // A null pointer and an absent field are the same thing in Cap'n Proto, so
+  // C++ treats `null` for a Text/Data/List/Struct field as "not present"
+  // (isPointerToJsonNull). It matters for reading C++ output: the encoder
+  // emits `"field": null` for an active union member whose pointer is null.
+  // -------------------------------------------------------------------
+
+  /// `null` leaves a pointer-typed field unset rather than erroring, and
+  /// without allocating an empty value for it.
+  #[test]
+  fn null_means_absent_for_pointer_fields() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = concat!(
+      r#"{"textField":null,"dataField":null,"#,
+      r#""structField":null,"textList":null,"int8Field":7}"#
+    );
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(json, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert!(!r.has_text_field(), "null must not allocate a text field");
+    assert!(!r.has_data_field());
+    assert!(!r.has_struct_field(), "null must not init the struct");
+    assert!(!r.has_text_list());
+    // The rest of the object is still decoded.
+    assert_eq!(r.get_int8_field(), 7);
+    // ... and nothing was written, so it re-encodes without those fields.
+    assert!(!json::to_json(r)?.contains("textField"));
+    Ok(())
+  }
+
+  /// `null` is not blanket-accepted: only the pointer types treat it as
+  /// absence. `Void`'s *value* is null, so it must still be set.
+  #[test]
+  fn null_is_only_absence_for_pointer_types() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    for json in [
+      r#"{"int8Field":null}"#,
+      r#"{"uInt32Field":null}"#,
+      r#"{"boolField":null}"#,
+      r#"{"enumField":null}"#,
+    ] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      assert!(
+        json::from_json(json, root).is_err(),
+        "{json} must not be accepted; null is not a value for this type"
+      );
+    }
+
+    // Void decodes *from* null, so it must be accepted and set.
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(r#"{"voidField":null}"#, root.reborrow())?;
+    Ok(())
+  }
+
+  /// Floats take `null` as NaN, which is what C++ does.
+  #[test]
+  fn null_decodes_to_nan_for_floats() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(
+      r#"{"float32Field":null,"float64Field":null,"float32List":[null,1.5]}"#,
+      root.reborrow(),
+    )?;
+
+    let r = root.reborrow_as_reader();
+    assert!(r.get_float32_field().is_nan());
+    assert!(r.get_float64_field().is_nan());
+    // The rule lives in the value decoder, so list elements get it too.
+    let list = r.get_float32_list()?;
+    assert!(list.get(0).is_nan());
+    assert_eq!(list.get(1), 1.5);
+    Ok(())
+  }
+
+  /// Absence is a property of the *field*, so it does not extend to list
+  /// elements: C++ decodes arrays without the check, and so do we.
+  #[test]
+  fn null_is_still_an_error_as_a_list_element() {
+    use crate::test_capnp::test_json_types;
+
+    for json in [r#"{"textList":[null]}"#, r#"{"structList":[null]}"#] {
+      let mut builder = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = builder.init_root();
+      assert!(
+        json::from_json(json, root).is_err(),
+        "{json}: null is not a text or struct value"
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // \uXXXX surrogate pairs
+  // -------------------------------------------------------------------
+
+  /// Write each UTF-16 code unit as a JSON `\uXXXX` escape.
+  ///
+  /// Built at runtime rather than written as a source literal on purpose: an
+  /// editor or tool that normalises escape sequences will happily turn a
+  /// literal surrogate pair into the character it denotes, which would leave
+  /// these tests silently exercising the literal-UTF-8 path instead of the
+  /// escape path they exist for.
+  fn u_escapes(units: &[u16]) -> String {
+    let mut out = String::new();
+    for unit in units {
+      out.push('\\');
+      out.push('u');
+      out.push_str(&format!("{unit:04X}"));
+    }
+    out
+  }
+
+  fn text_field_json(body: &str) -> String {
+    format!("{{\"textField\":\"{body}\"}}")
+  }
+
+  /// A character above U+FFFF is written as a *pair* of `\u` escapes, which is
+  /// what any escaping JSON producer emits for an emoji. The two halves must
+  /// be recombined; decoding them separately yields unpaired surrogates, which
+  /// are not Unicode scalar values and cannot appear in UTF-8.
+  #[test]
+  fn surrogate_pairs_decode_to_one_character() -> capnp::Result<()> {
+    use crate::test_capnp::test_blob;
+
+    let cases = [
+      // U+1F600 GRINNING FACE.
+      (text_field_json(&u_escapes(&[0xD83D, 0xDE00])), "\u{1F600}"),
+      // U+10437, exercising a different pair of surrogates.
+      (text_field_json(&u_escapes(&[0xD801, 0xDC37])), "\u{10437}"),
+      // Surrounded by ordinary characters.
+      (
+        text_field_json(&format!("a{}b", u_escapes(&[0xD83D, 0xDE00]))),
+        "a\u{1F600}b",
+      ),
+      // Two pairs back to back: the parser must resume correctly after one.
+      (
+        text_field_json(&u_escapes(&[0xD83D, 0xDE00, 0xD83D, 0xDE01])),
+        "\u{1F600}\u{1F601}",
+      ),
+      // BMP escapes are unaffected.
+      (
+        text_field_json(&u_escapes(&[0x00E9, 0x4E2D])),
+        "\u{E9}\u{4E2D}",
+      ),
+      // The literal UTF-8 form keeps working; this is what C++ emits.
+      (text_field_json("\u{1F600}"), "\u{1F600}"),
+    ];
+
+    for (json, expected) in cases {
+      let mut builder = message::Builder::new_default();
+      let mut root: test_blob::Builder<'_> = builder.init_root();
+      json::from_json(&json, root.reborrow())?;
+      assert_eq!(
+        root.reborrow_as_reader().get_text_field()?.to_str()?,
+        expected,
+        "decoding {json}"
+      );
+    }
+    Ok(())
+  }
+
+  /// An unpaired surrogate has no UTF-8 representation at all, so it is
+  /// rejected rather than silently replaced with U+FFFD.
+  #[test]
+  fn unpaired_surrogates_are_rejected() {
+    use crate::test_capnp::test_blob;
+
+    let cases = [
+      // Leading surrogate at end of string.
+      text_field_json(&u_escapes(&[0xD83D])),
+      // Leading surrogate followed by an ordinary character.
+      text_field_json(&format!("{}x", u_escapes(&[0xD83D]))),
+      // Leading surrogate followed by a non-surrogate escape.
+      text_field_json(&u_escapes(&[0xD83D, 0x0041])),
+      // Two leading surrogates.
+      text_field_json(&u_escapes(&[0xD83D, 0xD83D])),
+      // Trailing surrogate on its own.
+      text_field_json(&u_escapes(&[0xDE00])),
+      // Trailing surrogate before a valid pair.
+      text_field_json(&u_escapes(&[0xDE00, 0xD83D, 0xDE00])),
+    ];
+
+    for json in cases {
+      let mut builder = message::Builder::new_default();
+      let root: test_blob::Builder<'_> = builder.init_root();
+      let Err(e) = json::from_json(&json, root) else {
+        panic!("{json} must be rejected: unpaired surrogates are not UTF-8");
+      };
+      assert!(
+        e.extra.contains("surrogate"),
+        "{json}: unexpected error {}",
+        e.extra
+      );
+    }
+  }
+
+  /// The `&T` blanket impl must forward `decode_member`, not fall back to the
+  /// trait default. The default calls `init`, which is invalid for a
+  /// primitive field, so before this was forwarded the call failed with
+  /// `InitIsOnlyValidForStructAndAnyPointerFields`.
+  #[test]
+  fn ref_field_codec_forwards_decode_member() -> capnp::Result<()> {
+    use std::cell::Cell;
+
+    use crate::test_capnp::test_json_types;
+
+    struct Custom {
+      member_called: Cell<bool>,
+    }
+
+    impl json::FieldCodec for Custom {
+      fn encode_value(
+        &self,
+        _source: capnp::dynamic_value::Reader<'_>,
+      ) -> capnp::Result<JsonValue> {
+        Ok(JsonValue::Null)
+      }
+
+      fn decode_value(
+        &self,
+        _source: &JsonValue,
+        _target: capnp::dynamic_value::Builder<'_>,
+      ) -> capnp::Result<()> {
+        panic!("decode_value must not be reached; decode_member handles this")
+      }
+
+      fn decode_member(
+        &self,
+        _source: &JsonValue,
+        mut target: capnp::dynamic_struct::Builder<'_>,
+        field: capnp::schema::Field,
+      ) -> capnp::Result<()> {
+        self.member_called.set(true);
+        target.set(field, 42i8.into())
+      }
+    }
+
+    use capnp::introspect::Introspect;
+    let capnp::introspect::TypeVariant::Struct(schema) =
+      test_json_types::Owned::introspect().which()
+    else {
+      panic!("not a struct");
+    };
+    let field = capnp::schema::StructSchema::new(schema)
+      .get_field_by_name("int8Field")?;
+
+    let custom = Custom {
+      member_called: Cell::new(false),
+    };
+    // Register by reference, exercising `impl FieldCodec for &T`.
+    let codec = json::Codec::new()
+      .with_field_override(field, &custom as &dyn json::FieldCodec);
+
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    codec.decode(r#"{"int8Field":1}"#, root.reborrow())?;
+
+    assert!(
+      custom.member_called.get(),
+      "decode_member was not forwarded"
+    );
+    assert_eq!(root.reborrow_as_reader().get_int8_field(), 42);
+    Ok(())
+  }
+
+  #[test]
+  fn trailing_whitespace_is_accepted() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = "  \n\t  {\"int8Field\":7}  \n\t  ";
+    let mut builder = message::Builder::new_default();
+    let mut root: test_json_types::Builder<'_> = builder.init_root();
+    json::from_json(json, root.reborrow())?;
+    assert_eq!(root.reborrow_as_reader().get_int8_field(), 7);
+    Ok(())
+  }
+
+  #[test]
+  fn trailing_data_is_rejected() -> capnp::Result<()> {
+    use crate::test_capnp::test_json_types;
+
+    let json = r#"{"int8Field":7}  \n\t  {"int8Field":8}"#;
+    let mut builder = message::Builder::new_default();
+    let root: test_json_types::Builder<'_> = builder.init_root();
+    let Err(e) = json::from_json(json, root) else {
+      panic!("expected trailing data to be rejected");
+    };
+    assert_eq!(e.extra, "Trailing characters after JSON value");
+    Ok(())
+  }
+
+  // -------------------------------------------------------------------
+  // Flattened fields are created only when the JSON names one of their
+  // members. A flattened struct shares its parent's object rather than
+  // occupying a key, so there is no key whose absence would otherwise say
+  // "not present"; the decoder has to defer creating it until a member
+  // actually turns up.
+  // -------------------------------------------------------------------
+
+  /// Nothing in the JSON refers to the flattened struct, so it must not exist
+  /// afterwards.
+  #[test]
+  fn flattened_field_absent_is_not_created() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    for json in [r#"{}"#, r#"{"top":7}"#] {
+      let mut builder = message::Builder::new_default();
+      let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+      json::from_json(json, root.reborrow())?;
+
+      let r = root.reborrow_as_reader();
+      assert!(
+        !r.has_outer(),
+        "{json} must not create the flattened struct"
+      );
+      // ... so none of its members come back out on a re-encode. `top` is a
+      // primitive, so it is always present; only the flattened members are in
+      // question here.
+      let reencoded = json::to_json(r)?;
+      assert!(
+        !reencoded.contains("\"a\"") && !reencoded.contains("in."),
+        "{json} re-encoded as {reencoded}"
+      );
+    }
+    Ok(())
+  }
+
+  /// Naming one member creates the struct, and only as far down as needed.
+  #[test]
+  fn flattened_field_is_created_when_named() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    json::from_json(r#"{"a":"x"}"#, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert!(r.has_outer());
+    assert_eq!(r.get_outer()?.get_a()?.to_str()?, "x");
+    assert!(
+      !r.get_outer()?.has_inner(),
+      "the nested flattened struct was not named and must not exist"
+    );
+    Ok(())
+  }
+
+  /// Naming only the innermost member creates the whole chain, and matches on
+  /// the prefix rather than the bare name.
+  #[test]
+  fn nested_flattened_field_creates_its_parents() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    json::from_json(r#"{"in.b":"y"}"#, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert!(r.has_outer(), "the intermediate struct must be created");
+    assert!(r.get_outer()?.has_inner());
+    assert_eq!(r.get_outer()?.get_inner()?.get_b()?.to_str()?, "y");
+    assert!(!r.get_outer()?.has_a(), "sibling must stay at its default");
+
+    // The prefix is required: `b` on its own is an unknown field, ignored.
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    json::from_json(r#"{"b":"y"}"#, root.reborrow())?;
+    assert!(
+      !root.reborrow_as_reader().has_outer(),
+      "an unprefixed name must not match a prefixed flattened member"
+    );
+    Ok(())
+  }
+
+  /// Decoding merges into the builder, so a flattened field the JSON does not
+  /// mention must survive untouched. It used to be wiped: creating it went
+  /// through `init`, which replaces a struct field and clears a group.
+  #[test]
+  fn decoding_does_not_wipe_an_existing_flattened_field() -> capnp::Result<()> {
+    use crate::json_test_capnp::flatten_lazy;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<flatten_lazy::Builder<'_>>();
+    root.reborrow().init_outer().set_a("keep me");
+
+    json::from_json(r#"{"top":3}"#, root.reborrow())?;
+
+    let r = root.reborrow_as_reader();
+    assert_eq!(r.get_top(), 3);
+    assert_eq!(
+      r.get_outer()?.get_a()?.to_str()?,
+      "keep me",
+      "a flattened field the JSON did not mention must not be cleared"
+    );
+    Ok(())
+  }
+
+  /// The same, for a flattened *group*. `init` on a group clears it, so this
+  /// was destructive in a way `has_*` could not reveal.
+  #[test]
+  fn decoding_does_not_clear_an_existing_flattened_group() -> capnp::Result<()>
+  {
+    use crate::json_test_capnp::test_json_annotations;
+
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<test_json_annotations::Builder<'_>>();
+    root.reborrow().init_a_group().set_flat_foo(0xF00);
+
+    json::from_json(
+      r#"{"names-can_contain!anything Really":"x"}"#,
+      root.reborrow(),
+    )?;
+
+    assert_eq!(
+      root.reborrow_as_reader().get_a_group().get_flat_foo(),
+      0xF00,
+      "a flattened group the JSON did not mention must not be cleared"
+    );
+    Ok(())
+  }
+
+  /// A flattened struct that is a union member still gets activated by its
+  /// discriminator tag alone, with none of its own members present.
+  #[test]
+  fn flattened_union_member_is_activated_by_its_tag() -> capnp::Result<()> {
+    use crate::json_test_capnp::{
+      test_flattened_struct,
+      test_json_annotations3,
+    };
+
+    // Tag plus a member.
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<test_json_annotations3::Builder<'_>>();
+    json::from_json(r#"{"type":"bar","value":"v"}"#, root.reborrow())?;
+    match root.reborrow_as_reader().which()? {
+      test_json_annotations3::Bar(bar) => {
+        assert_eq!(bar?.get_value()?.to_str()?, "v")
+      }
+      test_json_annotations3::Foo(_) => panic!("expected bar"),
+    }
+
+    // Tag alone: the variant must still be selected.
+    let mut builder = message::Builder::new_default();
+    let mut root = builder.init_root::<test_json_annotations3::Builder<'_>>();
+    json::from_json(r#"{"type":"bar"}"#, root.reborrow())?;
+    match root.reborrow_as_reader().which()? {
+      test_json_annotations3::Bar(bar) => {
+        let _: test_flattened_struct::Reader<'_> = bar?;
+      }
+      test_json_annotations3::Foo(_) => {
+        panic!("the discriminator tag alone must select the variant")
+      }
+    }
     Ok(())
   }
 }
