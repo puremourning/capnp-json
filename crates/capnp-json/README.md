@@ -112,7 +112,6 @@ struct MyStruct {
 These matter mainly when decoding input you do not control; see the crate
 documentation for the full list.
 
-- Input after the top-level value is ignored rather than rejected.
 - `\uXXXX` surrogate pairs are combined into the character they denote, and
   unpaired surrogates are rejected. C++ decodes each escape separately and
   produces WTF-8, which is not valid UTF-8. Round-tripping is unaffected: the
@@ -120,10 +119,9 @@ documentation for the full list.
 - Only `Int64` / `UInt64` accept the string form of an integer when decoding;
   C++ accepts it for every integer width.
 
-Note that a JSON `null` for a pointer-typed field is accepted as "field
-absent", matching the C++ *main branch* (`isPointerToJsonNull`). That is not in
-any C++ release yet, so released versions reject it — this crate is the more
-permissive of the two.
+Note that a JSON `null` for a pointer-typed field is accepted as "field absent",
+matching the C++ *v2* branch. That is not in any v1 C++ release, so released
+versions reject it — this crate is the more permissive of the two.
 
 ## License
 
