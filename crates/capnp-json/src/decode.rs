@@ -27,66 +27,84 @@ use std::collections::BTreeMap;
 
 use super::JsonValue;
 
-struct Parser<I>
-where
-  I: Iterator<Item = char>,
-{
-  // FIXME: By using an iter over char here, we restrict ourselves to not
-  // being able to use string slices for must of the parsing. THis is piggy.
-  // It would be better to just have a &str and an index probably.
-  input_iter: std::iter::Peekable<std::iter::Fuse<I>>,
+/// A JSON parser over the input text.
+///
+/// Holds the whole input and an offset into it, rather than an iterator, so
+/// that strings and numbers can be taken as slices of the original. Scanning
+/// works on bytes: every character with structural meaning in JSON is ASCII,
+/// and no byte of a multi-byte UTF-8 sequence can be mistaken for one, so a
+/// position found by scanning for `"`, `\` or a delimiter is always on a
+/// character boundary and always safe to slice at.
+struct Parser<'input> {
+  input: &'input str,
+  pos:   usize,
 }
 
-impl<I> Parser<I>
-where
-  I: Iterator<Item = char>,
-{
-  fn new(iter: I) -> Self {
-    Self {
-      input_iter: iter.fuse().peekable(),
-    }
+impl<'input> Parser<'input> {
+  fn new(input: &'input str) -> Self {
+    Self { input, pos: 0 }
   }
 
-  /// Advance past any whitespace and peek at next value
-  fn peek_next(&mut self) -> Option<char> {
+  /// The byte at the current position.
+  fn peek(&self) -> Option<u8> {
+    self.input.as_bytes().get(self.pos).copied()
+  }
+
+  /// Advance past any whitespace and peek at the next byte.
+  fn peek_next(&mut self) -> Option<u8> {
     self.discard_whitespace();
     self.peek()
   }
 
-  /// Peek at the current value
-  fn peek(&mut self) -> Option<char> {
-    self.input_iter.peek().copied()
+  /// Consume the current byte.
+  fn advance(&mut self) -> capnp::Result<u8> {
+    let byte = self.peek().ok_or(ParseError::UnexpectedEndOfInput)?;
+    self.pos += 1;
+    Ok(byte)
   }
 
-  /// Consume the current value
-  fn advance(&mut self) -> capnp::Result<char> {
-    self
-      .input_iter
-      .next()
-      .ok_or(ParseError::UnexpectedEndOfInput.into())
-  }
-
-  /// Consume the current value if it matches `c`, otherwise error
-  fn consume(&mut self, c: char) -> capnp::Result<char> {
+  /// Consume the current byte if it matches, otherwise error.
+  fn consume(&mut self, byte: u8) -> capnp::Result<()> {
     match self.advance()? {
-      p if p == c => Ok(p),
-      p => Err(ParseError::InvalidToken(p).into()),
+      b if b == byte => Ok(()),
+      _ => {
+        self.pos -= 1;
+        Err(self.invalid_token())
+      }
     }
   }
 
-  /// Advance past any whitespace and consume the current value if it matches `c`, otherwise error
-  fn consume_next(&mut self, c: char) -> capnp::Result<char> {
+  /// Consume the given text if it is next, otherwise error. Used for the
+  /// three JSON literals.
+  fn consume_literal(&mut self, literal: &str) -> capnp::Result<()> {
+    if self.input[self.pos..].starts_with(literal) {
+      self.pos += literal.len();
+      Ok(())
+    } else {
+      Err(self.invalid_token())
+    }
+  }
+
+  /// Advance past any whitespace, then consume the given byte.
+  fn consume_next(&mut self, byte: u8) -> capnp::Result<()> {
     self.discard_whitespace();
-    match self.advance()? {
-      p if p == c => Ok(p),
-      p => Err(ParseError::InvalidToken(p).into()),
+    self.consume(byte)
+  }
+
+  /// Report the character at the current position. Decoded from the input
+  /// rather than from the byte, so a non-ASCII character is reported whole.
+  fn invalid_token(&self) -> capnp::Error {
+    match self.input[self.pos..].chars().next() {
+      Some(c) => ParseError::InvalidToken(c).into(),
+      None => ParseError::UnexpectedEndOfInput.into(),
     }
   }
 
   fn discard_whitespace(&mut self) {
-    while let Some(c) = self.peek() {
-      if c.is_whitespace() {
-        self.advance().ok();
+    while let Some(b) = self.peek() {
+      // JSON whitespace is only these four, all ASCII.
+      if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+        self.pos += 1;
       } else {
         break;
       }
@@ -118,122 +136,155 @@ where
 
     match self.peek_next() {
       None => Err(ParseError::UnexpectedEndOfInput.into()),
-      Some('n') => {
-        self.advance()?;
-        self.consume('u')?;
-        self.consume('l')?;
-        self.consume('l')?;
+      Some(b'n') => {
+        self.consume_literal("null")?;
         Ok(JsonValue::Null)
       }
-      Some('t') => {
-        self.advance()?;
-        self.consume('r')?;
-        self.consume('u')?;
-        self.consume('e')?;
+      Some(b't') => {
+        self.consume_literal("true")?;
         Ok(JsonValue::Boolean(true))
       }
-      Some('f') => {
-        self.advance()?;
-        self.consume('a')?;
-        self.consume('l')?;
-        self.consume('s')?;
-        self.consume('e')?;
+      Some(b'f') => {
+        self.consume_literal("false")?;
         Ok(JsonValue::Boolean(false))
       }
-      Some('\"') => Ok(JsonValue::String(self.parse_string()?)),
-      Some('0'..='9') | Some('-') => {
-        let num_str = self.parse_number()?;
-        let num = num_str.parse::<f64>().map_err(|e| {
-          ParseError::Other(format!("Invalid number format: {e}"))
-        })?;
-        Ok(JsonValue::Number(num))
+      Some(b'\"') => Ok(JsonValue::String(self.parse_string()?)),
+      Some(b'0'..=b'9') | Some(b'-') => {
+        Ok(JsonValue::Number(self.parse_number()?))
       }
-      Some('[') => {
+      Some(b'[') => {
         check_container_depth()?;
-        self.advance()?;
+        self.pos += 1;
         let mut items = Vec::new();
         let mut require_comma = false;
-        while self.peek_next().is_some_and(|c| c != ']') {
+        while self.peek_next().is_some_and(|b| b != b']') {
           if require_comma {
-            self.consume(',')?;
+            self.consume(b',')?;
           }
           require_comma = true;
-          let item = self.parse_value(options, recursion_level + 1)?;
-          items.push(item);
+          items.push(self.parse_value(options, recursion_level + 1)?);
         }
-        self.consume_next(']')?;
+        self.consume_next(b']')?;
         Ok(JsonValue::Array(items))
       }
-      Some('{') => {
+      Some(b'{') => {
         check_container_depth()?;
-        self.advance()?;
+        self.pos += 1;
         let mut members = BTreeMap::new();
         let mut require_comma = false;
-        while self.peek_next().is_some_and(|c| c != '}') {
+        while self.peek_next().is_some_and(|b| b != b'}') {
           if require_comma {
-            self.consume(',')?;
+            self.consume(b',')?;
           }
           require_comma = true;
           let key = self.parse_string()?;
-          self.consume_next(':')?;
+          self.consume_next(b':')?;
           let value = self.parse_value(options, recursion_level + 1)?;
-          if members.insert(key.clone(), value).is_some() {
-            return Err(
-              ParseError::Other(format!("Duplicate key in object: {key}"))
-                .into(),
-            );
-          }
-        }
-        self.consume_next('}')?;
-        Ok(JsonValue::Object(members))
-      }
-      Some(c) => Err(ParseError::InvalidToken(c).into()),
-    }
-  }
-
-  fn parse_string(&mut self) -> capnp::Result<String> {
-    self.consume_next('\"')?;
-    let mut result = String::new();
-    loop {
-      let c = self.advance()?;
-      match c {
-        '\"' => return Ok(result),
-        '\\' => {
-          let escaped = self.advance()?;
-          match escaped {
-            '\"' => result.push('\"'),
-            '\\' => result.push('\\'),
-            '/' => result.push('/'),
-            'b' => result.push('\u{08}'),
-            'f' => result.push('\u{0C}'),
-            'n' => result.push('\n'),
-            'r' => result.push('\r'),
-            't' => result.push('\t'),
-            'u' => result.push(self.parse_unicode_escape()?),
-            other => {
+          match members.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+              entry.insert(value);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
               return Err(
                 ParseError::Other(format!(
-                  "Invalid escape character: \\{other}"
+                  "Duplicate key in object: {}",
+                  entry.key()
                 ))
                 .into(),
               );
             }
           }
         }
-        other => result.push(other),
+        self.consume_next(b'}')?;
+        Ok(JsonValue::Object(members))
       }
+      Some(_) => Err(self.invalid_token()),
     }
+  }
+
+  /// Advance to the next `"` or `\`, whichever comes first.
+  fn scan_to_escape_or_quote(&mut self) {
+    let bytes = self.input.as_bytes();
+    while let Some(&b) = bytes.get(self.pos) {
+      if b == b'\"' || b == b'\\' {
+        break;
+      }
+      self.pos += 1;
+    }
+  }
+
+  fn parse_string(&mut self) -> capnp::Result<String> {
+    self.consume_next(b'\"')?;
+
+    // Common case: no escapes at all, so the value is one copy of the slice
+    // between the quotes with no per-character work.
+    let start = self.pos;
+    self.scan_to_escape_or_quote();
+    if self.peek() == Some(b'\"') {
+      let value = self.input[start..self.pos].to_owned();
+      self.pos += 1;
+      return Ok(value);
+    }
+
+    // Something needs unescaping. Copy what we have and carry on a run at a
+    // time, so only the escapes themselves are handled character by character.
+    let mut result = String::with_capacity(self.input.len() - start);
+    result.push_str(&self.input[start..self.pos]);
+    loop {
+      match self.advance()? {
+        b'\"' => return Ok(result),
+        b'\\' => self.parse_escape(&mut result)?,
+        // `scan_to_escape_or_quote` only stops at those two.
+        _ => unreachable!("scan stopped at a byte that is neither"),
+      }
+      let run = self.pos;
+      self.scan_to_escape_or_quote();
+      result.push_str(&self.input[run..self.pos]);
+    }
+  }
+
+  /// Handle one escape sequence, the leading `\` having been consumed.
+  fn parse_escape(&mut self, out: &mut String) -> capnp::Result<()> {
+    let escaped = self.advance()?;
+    out.push(match escaped {
+      b'\"' => '\"',
+      b'\\' => '\\',
+      b'/' => '/',
+      b'b' => '\u{08}',
+      b'f' => '\u{0C}',
+      b'n' => '\n',
+      b'r' => '\r',
+      b't' => '\t',
+      b'u' => return self.parse_unicode_escape(out),
+      other => {
+        return Err(
+          ParseError::Other(format!(
+            "Invalid escape character: \\{}",
+            other as char
+          ))
+          .into(),
+        );
+      }
+    });
+    Ok(())
   }
 
   /// Read the four hex digits of a `\uXXXX` escape, the `\u` itself having
   /// already been consumed.
   fn parse_hex4(&mut self) -> capnp::Result<u16> {
-    let mut hex = String::with_capacity(4);
-    for _ in 0..4 {
-      hex.push(self.advance()?);
-    }
-    u16::from_str_radix(&hex, 16).map_err(|_| {
-      ParseError::Other(format!("Invalid unicode escape: \\u{hex}")).into()
+    let digits = self
+      .input
+      .get(self.pos..self.pos + 4)
+      .filter(|d| d.bytes().all(|b| b.is_ascii_hexdigit()))
+      .ok_or_else(|| {
+        ParseError::Other(format!(
+          "Invalid unicode escape: \\u{}",
+          self.input[self.pos..].chars().take(4).collect::<String>()
+        ))
+      })?;
+    self.pos += 4;
+    u16::from_str_radix(digits, 16).map_err(|_| {
+      ParseError::Other(format!("Invalid unicode escape: \\u{digits}")).into()
     })
   }
 
@@ -258,7 +309,7 @@ where
   ///
   /// An unpaired surrogate has no representation in UTF-8 at all, so it is
   /// rejected rather than quietly replaced with U+FFFD.
-  fn parse_unicode_escape(&mut self) -> capnp::Result<char> {
+  fn parse_unicode_escape(&mut self, out: &mut String) -> capnp::Result<()> {
     const HIGH: std::ops::RangeInclusive<u16> = 0xD800..=0xDBFF;
     const LOW: std::ops::RangeInclusive<u16> = 0xDC00..=0xDFFF;
 
@@ -277,7 +328,7 @@ where
     if HIGH.contains(&unit) {
       // A leading surrogate is only half a character; the other half must be
       // the very next escape.
-      if self.peek() != Some('\\') {
+      if self.peek() != Some(b'\\') {
         return Err(
           ParseError::Other(format!(
             "Invalid unicode escape: \\u{unit:04X} is a leading surrogate and \
@@ -286,8 +337,8 @@ where
           .into(),
         );
       }
-      self.advance()?;
-      self.consume('u')?;
+      self.pos += 1;
+      self.consume(b'u')?;
 
       let low = self.parse_hex4()?;
       if !LOW.contains(&low) {
@@ -302,45 +353,50 @@ where
 
       let code_point =
         0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00));
-      return std::char::from_u32(code_point).ok_or_else(|| {
-        ParseError::Other(format!(
+      out.push(std::char::from_u32(code_point).ok_or_else(|| {
+        capnp::Error::from(ParseError::Other(format!(
           "Invalid unicode code point: \\u{unit:04X}\\u{low:04X}"
-        ))
-        .into()
-      });
+        )))
+      })?);
+      return Ok(());
     }
 
     // Not a surrogate, so it is a scalar value and the conversion cannot fail.
-    std::char::from_u32(unit as u32).ok_or_else(|| {
-      ParseError::Other(format!("Invalid unicode code point: \\u{unit:04X}"))
-        .into()
+    out.push(std::char::from_u32(unit as u32).ok_or_else(|| {
+      capnp::Error::from(ParseError::Other(format!(
+        "Invalid unicode code point: \\u{unit:04X}"
+      )))
+    })?);
+    Ok(())
+  }
+
+  /// Parse a number, returning it without building an intermediate `String`.
+  fn parse_number(&mut self) -> capnp::Result<f64> {
+    let start = self.pos;
+    if self.peek() == Some(b'-') {
+      self.pos += 1;
+    }
+    self.skip_digits();
+    if self.peek() == Some(b'.') {
+      self.pos += 1;
+      self.skip_digits();
+    }
+    if matches!(self.peek(), Some(b'e') | Some(b'E')) {
+      self.pos += 1;
+      if matches!(self.peek(), Some(b'+') | Some(b'-')) {
+        self.pos += 1;
+      }
+      self.skip_digits();
+    }
+    self.input[start..self.pos].parse::<f64>().map_err(|e| {
+      ParseError::Other(format!("Invalid number format: {e}")).into()
     })
   }
 
-  fn parse_number(&mut self) -> capnp::Result<String> {
-    let mut num_str = String::new();
-    if self.peek_next().is_some_and(|c| c == '-') {
-      num_str.push(self.advance()?);
+  fn skip_digits(&mut self) {
+    while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+      self.pos += 1;
     }
-    while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-      num_str.push(self.advance()?);
-    }
-    if self.peek().is_some_and(|c| c == '.') {
-      num_str.push(self.advance()?);
-      while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-        num_str.push(self.advance()?);
-      }
-    }
-    if self.peek().is_some_and(|c| c == 'e' || c == 'E') {
-      num_str.push(self.advance()?);
-      if self.peek().is_some_and(|c| c == '+' || c == '-') {
-        num_str.push(self.advance()?);
-      }
-      while self.peek().is_some_and(|c| c.is_ascii_digit()) {
-        num_str.push(self.advance()?);
-      }
-    }
-    Ok(num_str)
   }
 }
 
@@ -349,7 +405,7 @@ pub(crate) fn parse(
   json: &str,
   builder: capnp::dynamic_struct::Builder<'_>,
 ) -> capnp::Result<()> {
-  let mut parser = Parser::new(json.chars());
+  let mut parser = Parser::new(json);
   let mut value = parser.parse_value(&codec.options, 0)?;
   parser.discard_whitespace();
   if parser.peek().is_some() {
@@ -792,6 +848,20 @@ impl StructSink for Flattened<'_> {
   }
 }
 
+/// The JSON key for a field: its name with any flattening prefix in front.
+///
+/// Nothing is flattened in the common case, so the prefix is empty and the
+/// name can be borrowed from the schema rather than copied. This runs for
+/// every field of every struct decoded, so the allocation it avoids is a
+/// per-field one.
+fn json_key<'a>(prefix: &str, name: &'a str) -> std::borrow::Cow<'a, str> {
+  if prefix.is_empty() {
+    std::borrow::Cow::Borrowed(name)
+  } else {
+    std::borrow::Cow::Owned(format!("{prefix}{name}"))
+  }
+}
+
 fn is_union_member(field: capnp::schema::Field) -> bool {
   field.get_proto().get_discriminant_value()
     != capnp::schema_capnp::field::NO_DISCRIMINANT
@@ -916,6 +986,12 @@ fn decode_struct(
       .codec
       .and_then(|c| codec.registry.get(c))
       .or_else(|| {
+        // Consulting the override maps means hashing the field, and this runs
+        // for every field of every struct, present in the JSON or not. Most
+        // codecs register no overrides at all, so rule that out first.
+        if codec.field_overrides.is_empty() && codec.type_overrides.is_empty() {
+          return None;
+        }
         field_meta.field.and_then(|f| {
           codec
             .field_overrides
@@ -1044,7 +1120,7 @@ fn decode_struct(
 
   for field in sink.schema().get_non_union_fields()? {
     let field_meta = EncodingOptions::from_field(&field_prefix, field)?;
-    let field_name = format!("{}{}", field_prefix, field_meta.name);
+    let field_name = json_key(&field_prefix, field_meta.name);
 
     decode_member(
       recursion_level,
@@ -1085,9 +1161,11 @@ fn decode_struct(
       } else {
         meta.name
       };
-      let field_name = format!("{field_prefix}{discriminator_name}");
-      if let Some(JsonValue::String(discriminant)) = obj.remove(&field_name) {
-        Some(discriminant)
+      let field_name = json_key(&field_prefix, discriminator_name);
+      if let Some(JsonValue::String(discriminant)) =
+        obj.remove(field_name.as_ref())
+      {
+        Some(std::borrow::Cow::Owned(discriminant))
       } else {
         None
       }
@@ -1102,9 +1180,9 @@ fn decode_struct(
       let mut discriminant = None;
       for field in sink.schema().get_union_fields()? {
         let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
-        let field_name = format!("{}{}", field_prefix, field_meta.name);
-        if obj.contains_key(&field_name) {
-          discriminant = Some(field_meta.name.to_string());
+        let field_name = json_key(&field_prefix, field_meta.name);
+        if obj.contains_key(field_name.as_ref()) {
+          discriminant = Some(std::borrow::Cow::Borrowed(field_meta.name));
           break;
         }
       }
@@ -1115,7 +1193,7 @@ fn decode_struct(
   if let Some(discriminant) = discriminant {
     for field in sink.schema().get_union_fields()? {
       let field_meta = EncodingOptions::from_field(meta.prefix, field)?;
-      if field_meta.name != discriminant {
+      if field_meta.name != discriminant.as_ref() {
         continue;
       }
       let value_name = if let Some(discriminator) = discriminator {
@@ -1160,7 +1238,7 @@ mod test {
   fn test_parse_string() -> capnp::Result<()> {
     let json = r#""Hello, World!""#;
 
-    let mut parser = Parser::new(json.chars());
+    let mut parser = Parser::new(json);
     let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
 
     assert!(matches!(value, JsonValue::String(s) if s == "Hello, World!"));
@@ -1171,7 +1249,7 @@ mod test {
   fn test_parse_string_with_special_chars() -> capnp::Result<()> {
     let json = r#""Hełło,\nWorld!\"†ęś†: \u0007""#;
 
-    let mut parser = Parser::new(json.chars());
+    let mut parser = Parser::new(json);
     let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
 
     assert!(
@@ -1179,7 +1257,7 @@ mod test {
     );
 
     let json = r#"{"value":"tab: \t, newline: \n, carriage return: \r, quote: \", backslash: \\"}"#;
-    let mut parser = Parser::new(json.chars());
+    let mut parser = Parser::new(json);
     let value = parser.parse_value(&crate::CodecOptions::default(), 0)?;
     let JsonValue::Object(map) = value else {
       panic!("Expected object at top level");

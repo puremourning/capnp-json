@@ -2468,4 +2468,56 @@ mod tests {
     }
     Ok(())
   }
+
+  /// The escaping pass scans bytes rather than decoding characters, so the
+  /// cases that hinge on that are pinned here: DEL and the C1 controls must
+  /// still be escaped, and a character whose first byte is `C2` but which is
+  /// not a C1 control must pass through untouched.
+  #[test]
+  fn test_string_encoding_control_boundaries() -> capnp::Result<()> {
+    use crate::json_test_capnp::test_flattened_struct;
+
+    // (value, the JSON string literal it should encode to, quotes included)
+    let cases = [
+      // Either side of DEL, which has no short escape form.
+      ("~\u{7F}", "\"~\\u007f\""),
+      // The C1 controls, which are `C2 80`..`C2 9F` in UTF-8.
+      ("\u{80}", "\"\\u0080\""),
+      ("\u{9F}", "\"\\u009f\""),
+      // U+00A0 is `C2 A0`: the same lead byte, one past the C1 range, so it
+      // is an ordinary character and must survive as itself.
+      ("\u{A0}", "\"\u{A0}\""),
+      // A `C2` lead at the very end of the input must not read past it.
+      ("x\u{A0}", "\"x\u{A0}\""),
+      // Other multi-byte characters are untouched.
+      ("\u{E9}\u{4E2D}\u{1F600}", "\"\u{E9}\u{4E2D}\u{1F600}\""),
+      // Adjacent escapes, so a zero-length run between them is exercised.
+      ("\u{1}\u{2}", "\"\\u0001\\u0002\""),
+      ("\\\"", "\"\\\\\\\"\""),
+    ];
+
+    for (value, expected) in cases {
+      let mut builder = message::Builder::new_default();
+      let mut root: test_flattened_struct::Builder<'_> = builder.init_root();
+      root.set_value(value);
+
+      let encoded = json::to_json(root.reborrow_as_reader())?;
+      assert_eq!(
+        encoded,
+        format!("{{\"value\":{expected}}}"),
+        "encoding {value:?}"
+      );
+
+      // ... and it survives the round trip.
+      let mut rt = message::Builder::new_default();
+      let mut rt_root: test_flattened_struct::Builder<'_> = rt.init_root();
+      json::from_json(&encoded, rt_root.reborrow())?;
+      assert_eq!(
+        rt_root.reborrow_as_reader().get_value()?.to_str()?,
+        value,
+        "round-tripping {value:?}"
+      );
+    }
+    Ok(())
+  }
 }

@@ -4,32 +4,43 @@ pub(crate) mod base64 {
   const BASE64_CHARS: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-  pub(crate) fn encode(data: &[u8]) -> String {
-    let mut encoded = String::with_capacity(data.len().div_ceil(3) * 4);
+  /// Encode straight into a writer. Base64 output is pure ASCII, so callers
+  /// writing it into a JSON string can emit it without an escaping pass and
+  /// without an intermediate `String`.
+  pub(crate) fn encode_to<W: std::io::Write>(
+    writer: &mut W,
+    data: &[u8],
+  ) -> capnp::Result<()> {
+    // 3 input bytes -> 4 output bytes; a fixed buffer keeps this to one write
+    // per 48 input bytes rather than one per 3.
+    let mut out = [0u8; 64];
+    let mut len = 0;
     for chunk in data.chunks(3) {
       #[allow(clippy::get_first)]
       let b0 = chunk.get(0).copied().unwrap_or(0);
       let b1 = chunk.get(1).copied().unwrap_or(0);
       let b2 = chunk.get(2).copied().unwrap_or(0);
       let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-      let c0 = BASE64_CHARS[((n >> 18) & 0x3F) as usize];
-      let c1 = BASE64_CHARS[((n >> 12) & 0x3F) as usize];
-      let c2 = if chunk.len() > 1 {
+      out[len] = BASE64_CHARS[((n >> 18) & 0x3F) as usize];
+      out[len + 1] = BASE64_CHARS[((n >> 12) & 0x3F) as usize];
+      out[len + 2] = if chunk.len() > 1 {
         BASE64_CHARS[((n >> 6) & 0x3F) as usize]
       } else {
         b'='
       };
-      let c3 = if chunk.len() > 2 {
+      out[len + 3] = if chunk.len() > 2 {
         BASE64_CHARS[(n & 0x3F) as usize]
       } else {
         b'='
       };
-      encoded.push(c0 as char);
-      encoded.push(c1 as char);
-      encoded.push(c2 as char);
-      encoded.push(c3 as char);
+      len += 4;
+      if len == out.len() {
+        writer.write_all(&out)?;
+        len = 0;
+      }
     }
-    encoded
+    writer.write_all(&out[..len])?;
+    Ok(())
   }
 
   pub(crate) fn decode(data: &str) -> capnp::Result<Vec<u8>> {
@@ -91,15 +102,25 @@ pub(crate) mod hex {
     }
   }
 
-  pub(crate) fn encode(data: &[u8]) -> String {
-    let mut encoded = String::with_capacity(data.len() * 2);
+  /// Encode straight into a writer. Hex output is pure ASCII, so it needs no
+  /// escaping and no intermediate `String`.
+  pub(crate) fn encode_to<W: std::io::Write>(
+    writer: &mut W,
+    data: &[u8],
+  ) -> capnp::Result<()> {
+    let mut out = [0u8; 64];
+    let mut len = 0;
     for &byte in data {
-      let high = HEX_CHARS[(byte >> 4) as usize];
-      let low = HEX_CHARS[(byte & 0x0F) as usize];
-      encoded.push(high as char);
-      encoded.push(low as char);
+      out[len] = HEX_CHARS[(byte >> 4) as usize];
+      out[len + 1] = HEX_CHARS[(byte & 0x0F) as usize];
+      len += 2;
+      if len == out.len() {
+        writer.write_all(&out)?;
+        len = 0;
+      }
     }
-    encoded
+    writer.write_all(&out[..len])?;
+    Ok(())
   }
 
   pub(crate) fn decode(data: &str) -> capnp::Result<Vec<u8>> {

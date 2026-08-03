@@ -251,6 +251,19 @@ fn bench_small(c: &mut Criterion) {
     })
   });
 
+  // Decoding `{}` into a 36-field struct: no values at all, so what is left
+  // is the walk over the schema's fields. Isolates per-schema-field cost from
+  // per-value cost, which matters because decoding visits every field of the
+  // schema whether or not the JSON mentions it.
+  group.bench_function("decode_empty", |b| {
+    b.iter(|| {
+      let mut out = message::Builder::new_default();
+      let root: test_json_types::Builder<'_> = out.init_root();
+      json::from_json("{}", root).unwrap();
+      black_box(())
+    })
+  });
+
   group.finish();
 }
 
