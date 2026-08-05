@@ -14,8 +14,8 @@ authors = ["Ben Jackson <puremourning@gmail.com>"]
 repository = "https://github.com/puremourning/capnp-json"
 
 [workspace.dependencies]
-capnp = "0.27.0-alpha"
-capnpc = "0.27.0-alpha"
+capnp = "0.27"
+capnpc = "0.27"
 capnp-json = { path = "crates/capnp-json" }
 
 [workspace.metadata.release]
@@ -25,7 +25,3 @@ tag-name = "v{{version}}"
 allow-branch = ["main"]
 pre-release-commit-message = "Release v{{version}}"
 # `capnp-json-test` has `publish = false`, so cargo-release skips it.
-
-[patch.crates-io]
-capnp = { git = "https://github.com/capnproto/capnproto-rust", branch = "master", package = "capnp" }
-capnpc = { git = "https://github.com/capnproto/capnproto-rust", branch = "master", package = "capnpc" }

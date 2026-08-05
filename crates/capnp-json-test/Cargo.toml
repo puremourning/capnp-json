@@ -23,7 +23,7 @@ capnpc.workspace = true
 capnp-json.workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.5", default-features = false, features = [
+criterion = { version = "0.8", default-features = false, features = [
   "cargo_bench_support",
 ] }
 

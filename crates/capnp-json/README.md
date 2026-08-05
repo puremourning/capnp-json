@@ -9,6 +9,13 @@ message, using the schema's runtime type information. The wire format is
 compatible with the [C++ JSON codec](https://github.com/capnproto/capnproto/blob/master/c%2B%2B/src/capnp/compat/json.h)
 that ships with Cap'n Proto.
 
+## Compatibility
+
+Compatibile with `capnp`: `0.27`.
+
+`capnp-json` is only compatible with a particular minor release of `capnp` due
+to breaking changes and schema updates upstream.
+
 ## Usage
 
 Add the dependency:

@@ -26,6 +26,8 @@
 //! Run with `cargo bench -p capnp-json-test`, or one at a time with
 //! `cargo bench -p capnp-json-test -- decode/flattened`.
 
+use std::hint::black_box;
+
 use capnp::message;
 use capnp_json as json;
 use capnp_json_test::json_test_capnp::{
@@ -33,13 +35,7 @@ use capnp_json_test::json_test_capnp::{
   TestJsonAnnotatedEnum,
 };
 use capnp_json_test::test_capnp::{test_json_types, TestEnum};
-use criterion::{
-  black_box,
-  criterion_group,
-  criterion_main,
-  Criterion,
-  Throughput,
-};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 type Msg = message::Builder<message::HeapAllocator>;
 
