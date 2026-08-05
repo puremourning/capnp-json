@@ -9,6 +9,7 @@ include = [
   "src/**/*.rs",
   "build.rs",
   "json.capnp",
+  "rust-json.capnp",
   "README.md",
   "LICENSE",
 ]
@@ -20,14 +21,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[dependencies]
-capnp.workspace = true
-
-[build-dependencies]
-capnpc.workspace = true
-
 [package.metadata.release]
 # Keep the install snippet in the README pinned to the released version.
 pre-release-replacements = [
   { file = "README.md", search = 'capnp-json = "[^"]+"', replace = 'capnp-json = "{{version}}"', exactly = 1 },
 ]
+
+[dependencies]
+capnp.workspace = true
+
+[build-dependencies]
+capnpc.workspace = true
