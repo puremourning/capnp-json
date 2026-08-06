@@ -929,6 +929,157 @@ fn decode_list(
   }
 }
 
+/// Decode one `AnyPointer` field as the type declared for it with
+/// [`Codec::with_field_type`](crate::Codec::with_field_type).
+///
+/// This is the decoder's counterpart to the two lines that suffice on the
+/// encode side. Encoding dispatches on the *value*, so resolving the pointer
+/// to a `dynamic_value::Reader` is the whole job; decoding dispatches on the
+/// *type*, and every one of its per-type paths writes through a parent struct
+/// builder plus a `Field` whose declared type is still `AnyPointer`. So the
+/// arms cannot be reused as they stand and are reproduced here against
+/// `field_type.ty()` instead — the same code each declared type would reach,
+/// entered a different way.
+///
+/// The one thing this must supply that the ordinary path gets from the schema
+/// is the *length*: text, data and lists are sized when they are initialised
+/// and cannot be grown afterwards, and only the JSON knows how long they are.
+/// That is why `FieldType::init` takes one.
+///
+/// Split out of `decode_member` and never inlined so that its locals — a
+/// `JsonValue` and a `dynamic_value::Builder`, both large — are not charged to
+/// every frame of the decoder's recursion. `decode_member` recurses through
+/// `decode_struct` once per nested struct, and `CodecOptions::recursion_limit`
+/// is what stops that before the stack runs out; anything that grows that
+/// frame eats into the margin the limit is calibrated against.
+#[inline(never)]
+fn decode_typed_member(
+  recursion_level: usize,
+  codec: &super::Codec,
+  sink: &mut dyn StructSink,
+  field: capnp::schema::Field,
+  field_meta: &EncodingOptions,
+  obj: &mut std::collections::BTreeMap<String, JsonValue>,
+  value_name: &str,
+) -> capnp::Result<()> {
+  let Some(field_type) = codec.field_types.get(&field) else {
+    return Ok(());
+  };
+  let Some(mut field_value) = obj.remove(value_name) else {
+    return Ok(());
+  };
+
+  // Every type reachable here is a pointer type, so a JSON null means the
+  // field was not set rather than that it holds an empty value.
+  let ty = field_type.ty();
+  if is_pointer_to_json_null(&field_value, &ty) {
+    return Ok(());
+  }
+
+  // `init` clears the pointer and, for a union member, activates the variant.
+  //
+  // `Codec::with_anypointer_field_as` is the only way into `field_types` and
+  // it asserts the field is an AnyPointer, so `init` cannot return anything
+  // else here. This is an invariant of the registration, not a property of the
+  // document being decoded — no input can reach it.
+  let capnp::dynamic_value::Builder::AnyPointer(any) =
+    sink.builder()?.init(field)?
+  else {
+    unreachable!("a type was declared for a field that is not an AnyPointer")
+  };
+
+  match ty.which() {
+    capnp::introspect::TypeVariant::Struct(_) => {
+      // Structs take their size from the schema, so the length is ignored.
+      let capnp::dynamic_value::Builder::Struct(target) =
+        field_type.init(any, 0)?
+      else {
+        return Err(capnp::Error::failed(
+          "Declared struct type did not produce a struct builder".into(),
+        ));
+      };
+      // From here it decodes exactly as a declared struct field would, so the
+      // type's own `$Json.*` annotations and any codecs registered for the
+      // types inside it all apply.
+      decode_struct(
+        recursion_level + 1,
+        codec,
+        &mut field_value,
+        &mut Direct(target),
+        field_meta,
+      )
+    }
+
+    capnp::introspect::TypeVariant::List(_) => {
+      let JsonValue::Array(field_values) = field_value else {
+        return Err(capnp::Error::failed(format!(
+          "Expected array for field {}",
+          field_meta.name
+        )));
+      };
+      let capnp::dynamic_value::Builder::List(list_builder) =
+        field_type.init(any, field_values.len() as u32)?
+      else {
+        return Err(capnp::Error::failed(
+          "Declared list type did not produce a list builder".into(),
+        ));
+      };
+      decode_list(
+        recursion_level,
+        codec,
+        field_values,
+        list_builder,
+        field_meta,
+      )
+    }
+
+    // Text and data are decoded by the ordinary primitive path, which also
+    // applies `$Json.base64` and `$Json.hex`, and then copied into a pointer
+    // sized to match. There is no way to set them through the parent, since
+    // as far as the parent is concerned the field is still an AnyPointer.
+    capnp::introspect::TypeVariant::Text
+    | capnp::introspect::TypeVariant::Data => {
+      match decode_primitive(&mut field_value, &ty, field_meta)? {
+        capnp::dynamic_value::Reader::Text(text) => {
+          let bytes = text.as_bytes();
+          let capnp::dynamic_value::Builder::Text(target) =
+            field_type.init(any, bytes.len() as u32)?
+          else {
+            return Err(capnp::Error::failed(
+              "Declared text type did not produce a text builder".into(),
+            ));
+          };
+          target.as_bytes_mut().copy_from_slice(bytes);
+          Ok(())
+        }
+        capnp::dynamic_value::Reader::Data(data) => {
+          let capnp::dynamic_value::Builder::Data(target) =
+            field_type.init(any, data.len() as u32)?
+          else {
+            return Err(capnp::Error::failed(
+              "Declared data type did not produce a data builder".into(),
+            ));
+          };
+          target.copy_from_slice(data);
+          Ok(())
+        }
+        _ => Err(capnp::Error::failed(format!(
+          "Declared type for field {} did not decode to text or data",
+          field_meta.name
+        ))),
+      }
+    }
+
+    // `capnp::traits::Owned` is implemented only for pointer types, so the
+    // remaining variants are not reachable through `with_field_type`. An
+    // AnyPointer has nowhere to store a primitive in any case.
+    _ => Err(capnp::Error::unimplemented(format!(
+      "The type declared for field {} is not one an AnyPointer can hold",
+      field_meta.name
+    ))),
+  }
+}
+
 fn decode_struct(
   recursion_level: usize,
   codec: &super::Codec,
@@ -1005,6 +1156,27 @@ fn decode_struct(
         None => return Ok(()),
       };
       return field_codec.decode_member(&field_value, sink.builder()?, field);
+    }
+
+    // No codec claimed this field, so a declared type may reinterpret it. Same
+    // reasoning as the override maps above: skip the hash when no types are
+    // declared.
+    //
+    // The work itself lives in `decode_typed_member` rather than inline here.
+    // `decode_member` is one frame of the decoder's recursion, and the
+    // recursion limit is calibrated against how much stack that frame costs;
+    // giving that path its own frame keeps the cost off every field of every
+    // struct, declared or not. See `decode_typed_member`.
+    if !codec.field_types.is_empty() && codec.field_types.contains_key(&field) {
+      return decode_typed_member(
+        recursion_level,
+        codec,
+        sink,
+        field,
+        field_meta,
+        obj,
+        value_name,
+      );
     }
 
     match field.get_type().which() {

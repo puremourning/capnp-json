@@ -134,6 +134,25 @@
 //! `rust-json.capnp` (file ID `0xf955e504bf781ac6`); see
 //! [`Codec::with_named_codec`] for the `build.rs` setup it needs.
 //!
+//! # Reinterpreting `AnyPointer`
+//!
+//! A [`FieldCodec`] is the right tool when a value needs a JSON form of its
+//! own. When an `AnyPointer` field simply holds a known type, though, there is
+//! nothing to invent — it should encode the way that type already does.
+//! [`Codec::with_anypointer_field_as`] says so directly:
+//!
+//! ```ignore
+//! use capnp_json::Codec;
+//!
+//! let codec = Codec::new().with_anypointer_field_as::<payload::Owned>(field);
+//! ```
+//!
+//! The field then encodes and decodes as `payload` does, `$Json.*`
+//! annotations and nested codecs included, which is the part a `FieldCodec`
+//! would have had to reimplement by hand. `T` can be any pointer type — a
+//! generated struct, `capnp::text::Owned`, `capnp::primitive_list::Owned<u64>`
+//! and so on. See [`FieldType`] for what it takes to be one.
+//!
 //! # Compatibility notes
 //!
 //! The following are known divergences from the C++ codec. They matter mostly
@@ -725,6 +744,134 @@ pub fn make_field_codec<'env>(
   (encode_fn, decode_fn)
 }
 
+/// Declares what an `AnyPointer` field really holds, so it encodes and decodes
+/// as if the schema had said so.
+///
+/// An `AnyPointer` carries no type information — Cap'n Proto pointers are
+/// deliberately schema-external, and a struct pointer records its size but not
+/// which struct it is. So the type cannot be recovered from the message and
+/// has to be supplied from outside; that is all this trait does.
+///
+/// You do not normally name this trait.
+/// [`Codec::with_anypointer_field_as`] takes the type as a parameter and
+/// builds the implementation for you:
+///
+/// ```
+/// # use capnp::introspect::Introspect;
+/// use capnp_json::Codec;
+///
+/// # fn main() -> capnp::Result<()> {
+/// # let capnp::introspect::TypeVariant::Struct(schema) =
+/// #   capnp::schema_capnp::value::Owned::introspect().which()
+/// # else { unreachable!() };
+/// # let field = capnp::schema::StructSchema::new(schema)
+/// #   .get_field_by_name("anyPointer")?;
+/// // `field` is `Value.anyPointer`, which here always holds a `node`.
+/// let codec = Codec::new()
+///   .with_anypointer_field_as::<capnp::schema_capnp::node::Owned>(field);
+/// # let _ = codec;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Once declared, the field takes exactly the same path as a field the schema
+/// declares with that type: the mapped type's own `$Json.*` annotations apply,
+/// as do any [`FieldCodec`]s registered for the types within it. Nothing about
+/// the JSON representation is invented here — use a [`FieldCodec`] for that.
+///
+/// # Lifetimes
+///
+/// [`read`](FieldType::read) and [`init`](FieldType::init) are generic over
+/// `'a` rather than taking `Reader<'_>`, because what they return borrows from
+/// the *message*, not from the `FieldType`. Written with an elided lifetime,
+/// `&self` would capture the output under Rust's elision rules and the result
+/// would not outlive the registration.
+pub trait FieldType {
+  /// The type the field is to be treated as, from `T::introspect()`.
+  ///
+  /// This is what the decoder dispatches on in place of the field's declared
+  /// type, which is how the mapped field reaches the same code a declared
+  /// field of this type would.
+  fn ty(&self) -> capnp::introspect::Type;
+
+  /// Read the pointer as this type, during encoding.
+  fn read<'a>(
+    &self,
+    any: capnp::any_pointer::Reader<'a>,
+  ) -> capnp::Result<capnp::dynamic_value::Reader<'a>>;
+
+  /// Initialise the pointer as this type, during decoding.
+  ///
+  /// `len` is the element count the JSON implies — an array's length, a
+  /// string's length in bytes — and is ignored for struct types, which take
+  /// their size from the schema. The returned builder writes through to the
+  /// pointer, so decoding into it populates the message.
+  fn init<'a>(
+    &self,
+    any: capnp::any_pointer::Builder<'a>,
+    len: u32,
+  ) -> capnp::Result<capnp::dynamic_value::Builder<'a>>;
+}
+
+/// The [`FieldType`] implementation for a generated `Owned` type. Constructed
+/// by [`Codec::with_anypointer_field_as`]; it holds no data, only the type parameter.
+struct Typed<T>(core::marker::PhantomData<fn() -> T>);
+
+/// Every pointer type has the pieces this needs, so one implementation covers
+/// structs, text, data and every flavour of list.
+///
+/// The two `for<'a>` clauses look like they should be implied — every type
+/// `capnpc` generates satisfies them, as do `capnp`'s own `text`, `data` and
+/// list types — but [`Owned`](capnp::traits::Owned) itself only promises
+/// `FromPointerReader`/`FromPointerBuilder`, so through a type parameter that
+/// is all the compiler may assume. Spelling them out is what reaches the
+/// `From<foo::Builder<'a>> for dynamic_value::Builder<'a>` impls, which are
+/// the only public route from a concrete builder back to a dynamic one.
+/// (`capnp::traits` has an `IntoInternalStructReader` for the reader half of
+/// this, but no builder counterpart.)
+///
+/// `Owned` is implemented only for pointer types, never for bare primitives,
+/// so this bound also makes the cases an `AnyPointer` could not hold anyway —
+/// `with_anypointer_field_as::<u64>` — fail to compile rather than fail at runtime.
+impl<T> FieldType for Typed<T>
+where
+  T: capnp::traits::Owned,
+  for<'a> <T as capnp::traits::Owned>::Reader<'a>:
+    Into<capnp::dynamic_value::Reader<'a>>,
+  for<'a> <T as capnp::traits::Owned>::Builder<'a>:
+    Into<capnp::dynamic_value::Builder<'a>>,
+{
+  fn ty(&self) -> capnp::introspect::Type {
+    <T as capnp::introspect::Introspect>::introspect()
+  }
+
+  fn read<'a>(
+    &self,
+    any: capnp::any_pointer::Reader<'a>,
+  ) -> capnp::Result<capnp::dynamic_value::Reader<'a>> {
+    Ok(
+      any
+        .get_as::<<T as capnp::traits::Owned>::Reader<'a>>()?
+        .into(),
+    )
+  }
+
+  fn init<'a>(
+    &self,
+    any: capnp::any_pointer::Builder<'a>,
+    len: u32,
+  ) -> capnp::Result<capnp::dynamic_value::Builder<'a>> {
+    // `initn_as` rather than `init_as`: text, data and lists need their length
+    // up front and cannot be grown afterwards. Struct builders ignore it and
+    // use `STRUCT_SIZE`, so one call covers every case.
+    Ok(
+      any
+        .initn_as::<<T as capnp::traits::Owned>::Builder<'a>>(len)
+        .into(),
+    )
+  }
+}
+
 /// Encoding and decoding options for a [`Codec`].
 ///
 /// Construct with [`Default`] and adjust what you need, so that options added
@@ -839,6 +986,12 @@ impl Default for CodecOptions {
 /// If none matches and the value is a struct, a `$Rust.codec("name")`
 /// annotation on the *struct's own declaration* is used if one is present.
 ///
+/// A type declared with [`with_anypointer_field_as`](Codec::with_anypointer_field_as) is
+/// considered only after all of the above have failed to match, so a codec
+/// bound to a field always beats a declared type for the same field. The two
+/// are not meant to be combined: a codec replaces the field's JSON
+/// representation outright, which leaves the declaration nothing to do.
+///
 /// A `$Rust.codec` name that is not registered is silently ignored and the
 /// default encoding applies.
 ///
@@ -854,10 +1007,19 @@ impl Default for CodecOptions {
 ///   `List(T)` rather than for `T` — one registered for `T` will not fire for
 ///   the elements. A `$Rust.codec` annotation on a list field behaves the
 ///   other way round: it is applied to each element in turn.
+///
+/// [`with_anypointer_field_as`](Codec::with_anypointer_field_as) is matched against a field in
+/// the same way, and so behaves like the overrides rather than like the
+/// annotation: declaring `List(T)` for an `AnyPointer` field applies once, to
+/// the field, and the elements are then decoded as `T` by the ordinary list
+/// path rather than by consulting the declaration again.
 pub struct Codec<'env> {
   field_overrides: HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
   type_overrides:  HashMap<capnp::introspect::Type, Box<dyn FieldCodec + 'env>>,
   registry:        HashMap<String, Box<dyn FieldCodec + 'env>>,
+
+  pub(crate) field_types:
+    HashMap<capnp::schema::Field, Box<dyn FieldType + 'env>>,
 
   options: CodecOptions,
 }
@@ -881,6 +1043,7 @@ impl<'env> Codec<'env> {
       field_overrides: HashMap::new(),
       type_overrides: HashMap::new(),
       registry: HashMap::new(),
+      field_types: HashMap::new(),
       options,
     }
   }
@@ -991,6 +1154,79 @@ impl<'env> Codec<'env> {
     codec: impl FieldCodec + 'env,
   ) -> Self {
     self.registry.insert(name.into(), Box::new(codec));
+    self
+  }
+
+  /// Treat `field` as if the schema declared it with type `T`.
+  ///
+  /// `field` must be an `AnyPointer` field, and is obtained the same way as
+  /// for [`with_field_override`](Codec::with_field_override). `T` is a
+  /// generated `Owned` type, or one of `capnp`'s own:
+  ///
+  /// ```ignore
+  /// let codec = Codec::new()
+  ///   .with_anypointer_field_as::<payload::Owned>(struct_field)
+  ///   .with_anypointer_field_as::<capnp::text::Owned>(text_field)
+  ///   .with_anypointer_field_as::<capnp::primitive_list::Owned<u64>>(list_field);
+  /// ```
+  ///
+  /// The field then encodes and decodes exactly as a declared field of that
+  /// type does, honouring the type's own `$Json.*` annotations and any codecs
+  /// registered for the types within it. Unlike a [`FieldCodec`], this does
+  /// not give the field a JSON representation of its own — it only says what
+  /// the pointer holds.
+  ///
+  /// A [`FieldCodec`] bound to the same field takes precedence and this is not
+  /// consulted; see [which codec wins](Codec#which-codec-wins). Declaring a
+  /// second type for the same field replaces the first.
+  ///
+  /// # Decoding is destructive
+  ///
+  /// Decoding a declared field clears the pointer and initialises it afresh,
+  /// so it replaces whatever the field held rather than merging into it. This
+  /// matches how a normal struct field present in the JSON behaves.
+  ///
+  /// # Panics
+  ///
+  /// If `field` is not an `AnyPointer` field. Every other type says what it
+  /// holds already, so there is nothing to declare and nothing this could
+  /// sensibly do; a field of the wrong type is a mistake in the code that
+  /// builds the [`Codec`], not something a document being encoded can cause.
+  /// Catching it here rather than returning an error keeps the builder chain
+  /// free of `?` and makes the mistake surface while wiring the codec up, not
+  /// on the first message that happens to use the field.
+  ///
+  /// The type parameter needs no such check: `capnp::traits::Owned` is
+  /// implemented only for pointer types, so a `T` an `AnyPointer` could not
+  /// hold — `with_anypointer_field_as::<u64>` — fails to compile.
+  pub fn with_anypointer_field_as<T>(
+    mut self,
+    field: capnp::schema::Field,
+  ) -> Self
+  where
+    T: capnp::traits::Owned + 'env,
+    for<'a> <T as capnp::traits::Owned>::Reader<'a>:
+      Into<capnp::dynamic_value::Reader<'a>>,
+    for<'a> <T as capnp::traits::Owned>::Builder<'a>:
+      Into<capnp::dynamic_value::Builder<'a>>,
+  {
+    assert!(
+      matches!(
+        field.get_type().which(),
+        capnp::introspect::TypeVariant::AnyPointer
+      ),
+      "with_anypointer_field_as: field {} is not an AnyPointer",
+      field
+        .get_proto()
+        .get_name()
+        .ok()
+        .and_then(|n| n.to_str().ok())
+        .unwrap_or("<unknown>"),
+    );
+
+    self
+      .field_types
+      .insert(field, Box::new(Typed::<T>(core::marker::PhantomData)));
     self
   }
 

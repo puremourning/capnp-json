@@ -992,6 +992,289 @@ mod tests {
     Ok(())
   }
 
+  /// The field of `TestAnyPointer` that every declared-type test targets.
+  fn any_pointer_field() -> capnp::Result<capnp::schema::Field> {
+    use capnp::introspect::Introspect;
+    let capnp::introspect::TypeVariant::Struct(schema) =
+      crate::json_test_capnp::test_any_pointer::Owned::introspect().which()
+    else {
+      panic!("Expected struct");
+    };
+    capnp::schema::StructSchema::new(schema)
+      .get_field_by_name("anyPointerField")
+  }
+
+  #[test]
+  fn any_pointer_encodes_as_declared_type() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    root
+      .reborrow()
+      .init_any_pointer_field()
+      .init_as::<crate::json_test_capnp::test_flattened_struct::Builder<'_>>()
+      .set_value("hi");
+
+    let codec = json::Codec::new().with_anypointer_field_as::<
+        crate::json_test_capnp::test_flattened_struct::Owned,
+      >(any_pointer_field()?);
+
+    assert_eq!(
+      r#"{"anyPointerField":{"value":"hi"}}"#,
+      codec.encode(root.reborrow_as_reader())?
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn any_pointer_decodes_as_declared_type() -> capnp::Result<()> {
+    let codec = json::Codec::new().with_anypointer_field_as::<
+        crate::json_test_capnp::test_flattened_struct::Owned,
+      >(any_pointer_field()?);
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(r#"{"anyPointerField":{"value":"hi"}}"#, root.reborrow())?;
+
+    let mapped = root
+      .reborrow_as_reader()
+      .get_any_pointer_field()
+      .get_as::<crate::json_test_capnp::test_flattened_struct::Reader<'_>>(
+    )?;
+    assert_eq!("hi", mapped.get_value()?.to_str()?);
+    Ok(())
+  }
+
+  /// The point of declaring a type rather than writing a `FieldCodec`: the
+  /// declared type's own `$Json.*` annotations apply without anything here
+  /// knowing about them. `foo` is `$Json.name`d to `renamed-foo`.
+  #[test]
+  fn declared_type_honours_json_annotations() -> capnp::Result<()> {
+    let codec = json::Codec::new().with_anypointer_field_as::<
+        crate::json_test_capnp::test_json_annotations2::Owned,
+      >(any_pointer_field()?);
+
+    let json = r#"{"anyPointerField":{"renamed-foo":"bar"}}"#;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+
+    let mapped = root
+      .reborrow_as_reader()
+      .get_any_pointer_field()
+      .get_as::<crate::json_test_capnp::test_json_annotations2::Reader<'_>>(
+    )?;
+    assert_eq!("bar", mapped.get_foo()?.to_str()?);
+
+    // and back out again
+    assert_eq!(json, codec.encode(root.reborrow_as_reader())?);
+    Ok(())
+  }
+
+  /// A declaration is scoped to the field it is registered for, exactly as a
+  /// field override is, so a plain codec still rejects the same AnyPointer.
+  #[test]
+  fn declared_type_does_not_leak_to_other_codecs() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    root
+      .reborrow()
+      .init_any_pointer_field()
+      .init_as::<crate::json_test_capnp::test_flattened_struct::Builder<'_>>()
+      .set_value("hi");
+
+    assert!(matches!(
+      json::to_json(root.reborrow_as_reader()),
+      Err(capnp::Error {
+        kind: capnp::ErrorKind::Unimplemented,
+        ..
+      })
+    ));
+    Ok(())
+  }
+
+  /// Text was impossible while the knob was a builder-mapping closure: text is
+  /// sized when it is initialised and cannot be grown, and the closure had no
+  /// way to learn the length. Declaring the type moves the length to where the
+  /// JSON is, so this works.
+  #[test]
+  fn any_pointer_can_be_declared_as_text() -> capnp::Result<()> {
+    let codec = json::Codec::new()
+      .with_anypointer_field_as::<capnp::text::Owned>(any_pointer_field()?);
+
+    let json = r#"{"anyPointerField":"hello, text"}"#;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+
+    assert_eq!(
+      "hello, text",
+      root
+        .reborrow_as_reader()
+        .get_any_pointer_field()
+        .get_as::<capnp::text::Reader<'_>>()?
+        .to_str()?
+    );
+    assert_eq!(json, codec.encode(root.reborrow_as_reader())?);
+    Ok(())
+  }
+
+  /// Likewise a list: `initn_as` sizes it from the JSON array's length.
+  #[test]
+  fn any_pointer_can_be_declared_as_a_primitive_list() -> capnp::Result<()> {
+    let codec = json::Codec::new()
+      .with_anypointer_field_as::<capnp::primitive_list::Owned<u32>>(
+        any_pointer_field()?,
+      );
+
+    let json = r#"{"anyPointerField":[1,2,3]}"#;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+
+    let list = root
+      .reborrow_as_reader()
+      .get_any_pointer_field()
+      .get_as::<capnp::primitive_list::Reader<'_, u32>>()?;
+    assert_eq!(vec![1, 2, 3], list.iter().collect::<Vec<_>>());
+    assert_eq!(json, codec.encode(root.reborrow_as_reader())?);
+    Ok(())
+  }
+
+  /// A list of structs, so the element type's own annotations have to survive
+  /// the declaration too.
+  #[test]
+  fn any_pointer_can_be_declared_as_a_struct_list() -> capnp::Result<()> {
+    let codec = json::Codec::new()
+      .with_anypointer_field_as::<capnp::struct_list::Owned<
+        crate::json_test_capnp::test_json_annotations2::Owned,
+      >>(any_pointer_field()?);
+
+    let json =
+      r#"{"anyPointerField":[{"renamed-foo":"a"},{"renamed-foo":"b"}]}"#;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+
+    let list = root
+      .reborrow_as_reader()
+      .get_any_pointer_field()
+      .get_as::<capnp::struct_list::Reader<
+      '_,
+      crate::json_test_capnp::test_json_annotations2::Owned,
+    >>()?;
+    assert_eq!(2, list.len());
+    assert_eq!("a", list.get(0).get_foo()?.to_str()?);
+    assert_eq!("b", list.get(1).get_foo()?.to_str()?);
+    assert_eq!(json, codec.encode(root.reborrow_as_reader())?);
+    Ok(())
+  }
+
+  /// Data goes through the ordinary primitive path, so `$Json.base64` and
+  /// friends would apply to a declared field just as they do to a normal one.
+  #[test]
+  fn any_pointer_can_be_declared_as_data() -> capnp::Result<()> {
+    let codec = json::Codec::new()
+      .with_anypointer_field_as::<capnp::data::Owned>(any_pointer_field()?);
+
+    let json = r#"{"anyPointerField":[1,2,255]}"#;
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(json, root.reborrow())?;
+
+    assert_eq!(
+      &[1u8, 2, 255],
+      root
+        .reborrow_as_reader()
+        .get_any_pointer_field()
+        .get_as::<capnp::data::Reader<'_>>()?
+    );
+    assert_eq!(json, codec.encode(root.reborrow_as_reader())?);
+    Ok(())
+  }
+
+  /// A JSON null means "not set" for every declared type, since all of them
+  /// are pointer types.
+  #[test]
+  fn null_leaves_a_declared_field_unset() -> capnp::Result<()> {
+    let codec = json::Codec::new()
+      .with_anypointer_field_as::<capnp::text::Owned>(any_pointer_field()?);
+
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    codec.decode(r#"{"anyPointerField":null}"#, root.reborrow())?;
+
+    assert!(root.reborrow_as_reader().get_any_pointer_field().is_null());
+    assert_eq!("{}", codec.encode(root.reborrow_as_reader())?);
+    Ok(())
+  }
+
+  /// A `FieldCodec` on the same field wins; the declaration is not consulted.
+  #[test]
+  fn field_codec_takes_precedence_over_declared_type() -> capnp::Result<()> {
+    let mut builder = capnp::message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::test_any_pointer::Builder<'_>>();
+    root
+      .reborrow()
+      .init_any_pointer_field()
+      .init_as::<crate::json_test_capnp::test_flattened_struct::Builder<'_>>()
+      .set_value("hi");
+
+    let codec = json::Codec::new()
+      .with_anypointer_field_as::<
+        crate::json_test_capnp::test_flattened_struct::Owned,
+      >(any_pointer_field()?)
+      .with_field_override(
+        any_pointer_field()?,
+        json::make_field_codec(
+          |_reader| Ok(JsonValue::String("from the codec".into())),
+          |_value, _builder| Ok(()),
+        ),
+      );
+
+    assert_eq!(
+      r#"{"anyPointerField":"from the codec"}"#,
+      codec.encode(root.reborrow_as_reader())?
+    );
+    Ok(())
+  }
+
+  /// Declaring a type for a field that is not an AnyPointer is a mistake in
+  /// the code that builds the codec, so it is caught while wiring the codec
+  /// up rather than on the first message that uses the field.
+  #[test]
+  #[should_panic(expected = "field foo is not an AnyPointer")]
+  fn declared_type_on_a_non_any_pointer_field_panics() {
+    use capnp::introspect::Introspect;
+    let capnp::introspect::TypeVariant::Struct(schema) =
+      crate::json_test_capnp::test_json_annotations2::Owned::introspect()
+        .which()
+    else {
+      panic!("Expected struct");
+    };
+    let text_field = capnp::schema::StructSchema::new(schema)
+      .get_field_by_name("foo")
+      .expect("foo exists");
+
+    let _ = json::Codec::new().with_anypointer_field_as::<
+        crate::json_test_capnp::test_flattened_struct::Owned,
+      >(text_field);
+  }
+
   #[test]
   fn test_different_overrides_for_different_brands() -> capnp::Result<()> {
     let json_text =

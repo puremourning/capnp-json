@@ -120,6 +120,38 @@ where
   {
     write_json_value(writer, &field_codec.encode_value(reader)?, meta, first)
   } else {
+    // No codec claimed this value, so a declared field type may reinterpret
+    // it. Same reasoning as the override maps above: skip the hash when none
+    // are registered.
+    //
+    // Only the read is needed here. Once the AnyPointer is resolved to a
+    // concrete `dynamic_value::Reader` the match below handles it like any
+    // other value, so declaring a type costs nothing further on this side —
+    // unlike decoding, which has to dispatch on the type rather than the
+    // value. See `decode::decode_typed_member`.
+    let reader = if codec.field_types.is_empty() {
+      reader
+    } else {
+      match meta.field.and_then(|f| codec.field_types.get(&f)) {
+        Some(field_type) => {
+          match reader {
+            capnp::dynamic_value::Reader::AnyPointer(any) => {
+              field_type.read(any)?
+            }
+            // The elements of a list carry their containing field's `meta`, so
+            // this runs again for each of them. The declaration applies to the
+            // field, not to its elements, and was already applied when the
+            // list itself came through — so leave an already-resolved value
+            // alone. (`with_type_override` has the same shape and the same
+            // caveat: it matches a field, and a list field's elements are not
+            // fields.)
+            resolved => resolved,
+          }
+        }
+        None => reader,
+      }
+    };
+
     match reader {
       capnp::dynamic_value::Reader::Void => {
         writer.write_all(b"null").map_err(Into::into)
@@ -409,6 +441,7 @@ fn write_object<'reader, W: std::io::Write>(
   } else {
     first
   };
+
   for field in reader.get_schema().get_non_union_fields()? {
     if !reader.has(field)? {
       continue;
