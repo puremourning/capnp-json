@@ -348,6 +348,113 @@ mod tests {
   }
 
   #[test]
+  fn roundtrip_flattend_named_union_with_prefix() -> capnp::Result<()> {
+    let mut builder = message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::flattened_named_union_with_prefix::Builder>();
+    root.reborrow().set_id(1);
+    root.reborrow().init_payload().set_foo("Hello");
+
+    let rust_json = capnp_json::to_json(root.reborrow_as_reader())?;
+    eprintln!(
+      "flattened_named_union_with_prefix Generated JSON: {}",
+      rust_json
+    );
+
+    let mut buf = vec![];
+    capnp::serialize::write_message(&mut buf, &builder)?;
+
+    let cpp_json = cpp_binary_to_json(
+      "./json-test.capnp",
+      "FlattenedNamedUnionWithPrefix",
+      &buf,
+    )?;
+    eprintln!(
+      "flattened_named_union_with_prefix CPP generated JSON: {}",
+      cpp_json
+    );
+
+    let mut read_json_builder = message::Builder::new_default();
+    let mut read_json_root =
+      read_json_builder
+        .init_root::<crate::json_test_capnp::flattened_named_union_with_prefix::Builder>();
+    capnp_json::from_json(&cpp_json, read_json_root.reborrow())?;
+
+    let read_json_root = read_json_root.into_reader();
+
+    assert_eq!(1, read_json_root.get_id());
+    assert!(matches!(
+      read_json_root.get_payload().which()?,
+      crate::json_test_capnp::flattened_named_union_with_prefix::payload::Foo(
+        _
+      )
+    ));
+
+    assert_eq!("Hello", {
+      let crate::json_test_capnp::flattened_named_union_with_prefix::payload::Foo(foo) = read_json_root.get_payload().which()? else {
+        panic!("Expected Foo variant");
+      };
+      foo?.to_str()?
+    });
+
+    Ok(())
+  }
+
+  #[test]
+  fn roundtrip_flattend_named_union_with_prefix_and_value_name(
+  ) -> capnp::Result<()> {
+    let mut builder = message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::flattened_named_union_with_prefix_and_value_name::Builder>();
+    root.reborrow().set_id(1);
+    root.reborrow().init_payload().set_foo("Hello");
+
+    let rust_json = capnp_json::to_json(root.reborrow_as_reader())?;
+    eprintln!(
+      "flattened_named_union_with_prefix_and_value_name Generated JSON: {}",
+      rust_json
+    );
+
+    let mut buf = vec![];
+    capnp::serialize::write_message(&mut buf, &builder)?;
+
+    let cpp_json = cpp_binary_to_json(
+      "./json-test.capnp",
+      "FlattenedNamedUnionWithPrefixAndValueName",
+      &buf,
+    )?;
+    eprintln!(
+      "flattened_named_union_with_prefix_and_value_name CPP generated JSON: {}",
+      cpp_json
+    );
+
+    let mut read_json_builder = message::Builder::new_default();
+    let mut read_json_root =
+      read_json_builder
+        .init_root::<crate::json_test_capnp::flattened_named_union_with_prefix_and_value_name::Builder>();
+    capnp_json::from_json(&cpp_json, read_json_root.reborrow())?;
+
+    let read_json_root = read_json_root.into_reader();
+
+    assert_eq!(1, read_json_root.get_id());
+    assert!(matches!(
+      read_json_root.get_payload().which()?,
+      crate::json_test_capnp::flattened_named_union_with_prefix_and_value_name::payload::Foo(
+        _
+      )
+    ));
+
+    assert_eq!("Hello", {
+      let crate::json_test_capnp::flattened_named_union_with_prefix_and_value_name::payload::Foo(foo) = read_json_root.get_payload().which()? else {
+        panic!("Expected Foo variant");
+      };
+      foo?.to_str()?
+    });
+
+    Ok(())
+  }
+
+  #[test]
   fn roundtrip_named_discriminator() -> capnp::Result<()> {
     let mut builder = message::Builder::new_default();
     let mut root = builder

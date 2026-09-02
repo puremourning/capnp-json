@@ -258,3 +258,21 @@ struct FlattenLazyOuter {
 struct FlattenLazyInner {
   b @0 :Text;
 }
+
+struct FlattenedNamedUnionWithPrefix {
+  id @0 :UInt32;
+
+  payload :union $Json.flatten(prefix="piper_") $Json.discriminator() {
+    foo @1 :Text;
+    bar @2 :UInt32;
+  }
+}
+
+struct FlattenedNamedUnionWithPrefixAndValueName {
+  id @0 :UInt32;
+
+  payload :union $Json.flatten(prefix="piper_") $Json.discriminator(valueName="piper_type") {
+    foo @1 :Text;
+    bar @2 :UInt32;
+  }
+}

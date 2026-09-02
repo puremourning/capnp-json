@@ -1368,15 +1368,18 @@ fn decode_struct(
       if field_meta.name != discriminant.as_ref() {
         continue;
       }
-      let value_name = if let Some(discriminator) = discriminator {
-        if discriminator.has_value_name() {
-          discriminator.get_value_name()?.to_str()?
+      let value_name = json_key(
+        &field_prefix,
+        if let Some(discriminator) = discriminator {
+          if discriminator.has_value_name() {
+            discriminator.get_value_name()?.to_str()?
+          } else {
+            field_meta.name
+          }
         } else {
           field_meta.name
-        }
-      } else {
-        field_meta.name
-      };
+        },
+      );
       if matches!(
         field.get_type().which(),
         capnp::introspect::TypeVariant::Void
@@ -1394,7 +1397,7 @@ fn decode_struct(
         field,
         &field_meta,
         value,
-        value_name,
+        value_name.as_ref(),
       )?;
       break;
     }
