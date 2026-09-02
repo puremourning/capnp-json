@@ -455,6 +455,74 @@ mod tests {
   }
 
   #[test]
+  fn roundtrip_named_union_renamed_with_unnamed_discriminator(
+  ) -> capnp::Result<()> {
+    let mut builder = message::Builder::new_default();
+    let mut root = builder
+      .init_root::<crate::json_test_capnp::renamed_named_union_with_discriminator::Builder>();
+    root.reborrow().set_id(1);
+    root.reborrow().init_payload().set_bar(());
+
+    let rust_json = capnp_json::to_json(root.reborrow_as_reader())?;
+    eprintln!(
+      "renamed_named_union_with_discriminator Generated JSON: {}",
+      rust_json
+    );
+
+    let mut buf = vec![];
+    capnp::serialize::write_message(&mut buf, &builder)?;
+
+    let cpp_json = cpp_binary_to_json(
+      "./json-test.capnp",
+      "RenamedNamedUnionWithDiscriminator",
+      &buf,
+    )?;
+    eprintln!(
+      "renamed_named_union_with_discriminator CPP generated JSON: {}",
+      cpp_json
+    );
+
+    let mut read_json_builder = message::Builder::new_default();
+    let mut read_json_root =
+      read_json_builder
+        .init_root::<crate::json_test_capnp::renamed_named_union_with_discriminator::Builder>();
+    capnp_json::from_json(&cpp_json, read_json_root.reborrow())?;
+
+    let read_json_root = read_json_root.into_reader();
+
+    assert_eq!(1, read_json_root.get_id());
+    assert!(matches!(
+      read_json_root.get_payload().which()?,
+      crate::json_test_capnp::renamed_named_union_with_discriminator::payload::Bar(
+        ()
+      )
+    ));
+
+    let cpp_binary = cpp_json_to_binary(
+      "./json-test.capnp",
+      "RenamedNamedUnionWithDiscriminator",
+      rust_json.as_bytes(),
+    )?;
+    let cpp_msg = capnp::serialize::read_message_from_flat_slice(
+      &mut &cpp_binary[..],
+      capnp::message::ReaderOptions::new(),
+    )?;
+
+    let read_cpp_root = cpp_msg
+      .get_root::<crate::json_test_capnp::renamed_named_union_with_discriminator::Reader>()?;
+
+    assert_eq!(1, read_cpp_root.get_id());
+    assert!(matches!(
+      read_cpp_root.get_payload().which()?,
+      crate::json_test_capnp::renamed_named_union_with_discriminator::payload::Bar(
+        ()
+      )
+    ));
+
+    Ok(())
+  }
+
+  #[test]
   fn roundtrip_named_discriminator() -> capnp::Result<()> {
     let mut builder = message::Builder::new_default();
     let mut root = builder

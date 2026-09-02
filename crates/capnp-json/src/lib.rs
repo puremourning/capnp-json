@@ -324,6 +324,20 @@ impl<'schema, 'prefix> EncodingOptions<'schema, 'prefix> {
     }
     Ok(options)
   }
+
+  /// The field's name as declared in the schema, ignoring `$Json.name`.
+  ///
+  /// An unnamed `$Json.discriminator()` on a flattened union falls back to
+  /// this rather than to [`Self::name`]. The C++ reference implementation
+  /// captures the declared name before applying the rename and uses that as
+  /// the fallback, so honouring `$Json.name` here would produce a
+  /// discriminator key the C++ codec does not recognise.
+  fn declared_name(&self) -> capnp::Result<&'schema str> {
+    match self.field {
+      Some(field) => Ok(field.get_proto().get_name()?.to_str()?),
+      None => Ok(self.name),
+    }
+  }
 }
 
 /// Check that a schema can be represented as JSON at all.

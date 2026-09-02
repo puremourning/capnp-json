@@ -276,3 +276,12 @@ struct FlattenedNamedUnionWithPrefixAndValueName {
     bar @2 :UInt32;
   }
 }
+
+struct RenamedNamedUnionWithDiscriminator {
+  id @0 :UInt32;
+
+  payload :union $Json.flatten() $Json.discriminator() $Json.name("thingamabob") {
+    foo @1 :Void;
+    bar @2 :Void;
+  }
+}

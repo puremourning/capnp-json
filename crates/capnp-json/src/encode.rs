@@ -490,7 +490,7 @@ fn write_object<'reader, W: std::io::Write>(
         let discriminator_name = if discriminator.has_name() {
           Some(discriminator.get_name()?.to_str()?)
         } else if flatten {
-          Some(meta.name)
+          Some(meta.declared_name()?)
         } else {
           // https://github.com/capnproto/capnproto/issues/2461
           // The discriminator is not output even if the annoyation is

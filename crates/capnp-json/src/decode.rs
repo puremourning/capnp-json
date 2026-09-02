@@ -1331,7 +1331,7 @@ fn decode_struct(
       let discriminator_name = if discriminator.has_name() {
         discriminator.get_name()?.to_str()?
       } else {
-        meta.name
+        meta.declared_name()?
       };
       let field_name = json_key(&field_prefix, discriminator_name);
       if let Some(JsonValue::String(discriminant)) =
