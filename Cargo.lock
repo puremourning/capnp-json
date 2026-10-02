@@ -40,9 +40,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "capnp"
-version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ebfc0da565e747b1640e029bfbda72f61f39fcddfc8b465b4ae3f3e8b649f78"
+version = "0.27.2"
+source = "git+https://github.com/puremourning/capnproto-rust?branch=newtype#8f7b2a2a8b3f66c6d1b8b8cc28c78d9540ef291b"
 dependencies = [
  "embedded-io",
 ]
@@ -68,8 +67,7 @@ dependencies = [
 [[package]]
 name = "capnpc"
 version = "0.27.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82ca16312ddb64529d31c8dc46148671c22e57b80134fa5f17811ad5a6a79492"
+source = "git+https://github.com/puremourning/capnproto-rust?branch=newtype#8f7b2a2a8b3f66c6d1b8b8cc28c78d9540ef291b"
 dependencies = [
  "capnp",
 ]
