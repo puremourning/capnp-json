@@ -39,37 +39,39 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "capnp"
-version = "0.27.2"
-source = "git+https://github.com/puremourning/capnproto-rust?branch=newtype#8f7b2a2a8b3f66c6d1b8b8cc28c78d9540ef291b"
-dependencies = [
- "embedded-io",
-]
-
-[[package]]
-name = "capnp-json"
+name = "capnp-json-newtype"
 version = "0.3.2"
 dependencies = [
- "capnp",
- "capnpc",
+ "capnp-newtype",
+ "capnpc-newtype",
 ]
 
 [[package]]
 name = "capnp-json-test"
 version = "0.3.2"
 dependencies = [
- "capnp",
- "capnp-json",
- "capnpc",
+ "capnp-json-newtype",
+ "capnp-newtype",
+ "capnpc-newtype",
  "criterion",
 ]
 
 [[package]]
-name = "capnpc"
-version = "0.27.0"
-source = "git+https://github.com/puremourning/capnproto-rust?branch=newtype#8f7b2a2a8b3f66c6d1b8b8cc28c78d9540ef291b"
+name = "capnp-newtype"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5de838d91bef5e4c76a15987600f668229d806fdf7614de5eb105f3bd456a1c"
 dependencies = [
- "capnp",
+ "embedded-io",
+]
+
+[[package]]
+name = "capnpc-newtype"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a412e42df28502085319075e9860377f562b6a662b2437044e4bfb93944853dd"
+dependencies = [
+ "capnp-newtype",
 ]
 
 [[package]]

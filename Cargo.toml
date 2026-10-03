@@ -14,9 +14,9 @@ authors = ["Ben Jackson <puremourning@gmail.com>"]
 repository = "https://github.com/puremourning/capnp-json"
 
 [workspace.dependencies]
-capnp = { git = "https://github.com/puremourning/capnproto-rust", branch = "newtype" }
-capnpc = { git = "https://github.com/puremourning/capnproto-rust", branch = "newtype" }
-capnp-json = { path = "crates/capnp-json" }
+capnp = { package = "capnp-newtype", version = "0.27" }
+capnpc = { package = "capnpc-newtype", version = "0.27" }
+capnp-json = { package = "capnp-json-newtype", path = "crates/capnp-json" }
 
 [workspace.metadata.release]
 # One shared version and a single `vX.Y.Z` tag for the whole workspace.

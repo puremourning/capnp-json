@@ -1,7 +1,7 @@
 [package]
-name = "capnp-json"
-description = "Cap'n Proto JSON codec for capnp-rust"
-documentation = "https://docs.rs/capnp-json"
+name = "capnp-json-newtype"
+description = "Cap'n Proto JSON codec for capnp-newtype"
+documentation = "https://docs.rs/capnp-json-newtype"
 readme = "README.md"
 keywords = ["capnp", "capnproto", "json", "codec", "serialization"]
 categories = ["encoding", "network-programming"]
@@ -26,6 +26,9 @@ repository.workspace = true
 pre-release-replacements = [
   { file = "README.md", search = 'capnp-json = "[^"]+"', replace = 'capnp-json = "{{version}}"', exactly = 1 },
 ]
+
+[lib]
+name = "capnp_json"
 
 [dependencies]
 capnp.workspace = true
