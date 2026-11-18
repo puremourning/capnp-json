@@ -403,18 +403,25 @@ impl<'input> Parser<'input> {
 pub(crate) fn parse(
   codec: &super::Codec,
   json: &str,
-  builder: capnp::dynamic_struct::Builder<'_>,
-) -> capnp::Result<()> {
+) -> capnp::Result<JsonValue> {
   let mut parser = Parser::new(json);
-  let mut value = parser.parse_value(&codec.options, 0)?;
+  let value = parser.parse_value(&codec.options, 0)?;
   parser.discard_whitespace();
   if parser.peek().is_some() {
     return Err(capnp::Error::failed(
       "Trailing characters after JSON value".into(),
     ));
   }
+  Ok(value)
+}
+
+pub(crate) fn decode_value(
+  codec: &super::Codec,
+  value: &mut JsonValue,
+  builder: capnp::dynamic_struct::Builder<'_>,
+) -> capnp::Result<()> {
   let meta = EncodingOptions::default();
-  decode_struct(0, codec, &mut value, &mut Direct(builder), &meta)
+  decode_struct(0, codec, value, &mut Direct(builder), &meta)
 }
 
 /// Whether a JSON `null` here means "this field is absent".

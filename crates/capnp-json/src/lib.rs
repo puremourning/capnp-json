@@ -1316,7 +1316,53 @@ impl<'env> Codec<'env> {
         "Top-level JSON value must be an object".into(),
       ));
     };
-    decode::parse(self, json, builder)
+    let mut value = decode::parse(self, json)?;
+    decode::decode_value(self, &mut value, builder)
+  }
+
+  /// Parse JSON text into a [`JsonValue`] without decoding it into any
+  /// Cap'n Proto type.
+  ///
+  /// Together with [`decode_value`](Codec::decode_value) this splits
+  /// [`decode`](Codec::decode) in two, for a caller that has to look at the
+  /// JSON before it knows which type to decode it as — for example an
+  /// envelope whose header fields say what type its payload is. The text is
+  /// parsed once; the caller reads what it needs from the value and decodes
+  /// the rest, or a part of it, with `decode_value`.
+  ///
+  /// Parsing applies this codec's [`CodecOptions`], so the
+  /// [recursion limit](CodecOptions::recursion_limit) bounds nesting here
+  /// just as it does in `decode`. Duplicate object keys and trailing
+  /// characters are rejected.
+  pub fn parse(&self, json: &str) -> capnp::Result<JsonValue> {
+    decode::parse(self, json)
+  }
+
+  /// Decode an already-parsed JSON object into a Cap'n Proto struct
+  /// builder.
+  ///
+  /// This behaves exactly as [`decode`](Codec::decode) does after parsing:
+  /// `value` must be a [`JsonValue::Object`], fields absent from it keep the
+  /// values already in `builder`, and members with no counterpart in the
+  /// schema are ignored.
+  ///
+  /// Decoding may rewrite parts of `value` in place (a `Data` field's text is
+  /// replaced by its decoded bytes, for instance), which is why it is taken
+  /// mutably. Do not rely on its contents afterwards.
+  ///
+  /// `value` is decoded from the top of the recursion limit, regardless of
+  /// how deeply it was nested in the document it was parsed from.
+  pub fn decode_value<'segments>(
+    &self,
+    value: &mut JsonValue,
+    builder: impl Into<capnp::dynamic_value::Builder<'segments>>,
+  ) -> capnp::Result<()> {
+    let capnp::dynamic_value::Builder::Struct(builder) = builder.into() else {
+      return Err(capnp::Error::failed(
+        "decode_value needs a struct builder".into(),
+      ));
+    };
+    decode::decode_value(self, value, builder)
   }
 }
 

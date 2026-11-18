@@ -405,6 +405,37 @@ mod tests {
   // Decode
 
   #[test]
+  fn test_parse_then_decode_part_of_the_value() -> capnp::Result<()> {
+    let codec = json::Codec::new();
+    let mut value = codec.parse(
+      r#"{"kind":7,"body":{"int32Field":-5,"dataField":[1,2],
+          "structField":{"textField":"inner"}}}"#,
+    )?;
+    let JsonValue::Object(members) = &mut value else {
+      panic!("expected an object");
+    };
+    assert_eq!(members.get("kind"), Some(&JsonValue::Number(7.0)));
+    let body = members.get_mut("body").expect("body");
+
+    let mut message = message::Builder::new_default();
+    let mut root =
+      message.init_root::<crate::test_capnp::test_all_types::Builder<'_>>();
+    codec.decode_value(body, root.reborrow())?;
+    let root = root.into_reader();
+    assert_eq!(root.get_int32_field(), -5);
+    assert_eq!(root.get_data_field()?, &[1, 2]);
+    assert_eq!(root.get_struct_field()?.get_text_field()?, "inner");
+
+    let mut message = message::Builder::new_default();
+    let root =
+      message.init_root::<crate::test_capnp::test_all_types::Builder<'_>>();
+    assert!(codec.decode_value(&mut JsonValue::Null, root).is_err());
+    assert!(codec.parse(r#"{"a":1} {"b":2}"#).is_err());
+    assert!(codec.parse(r#"{"a":1,"a":2}"#).is_err());
+    Ok(())
+  }
+
+  #[test]
   fn test_decode_simple() -> capnp::Result<()> {
     let mut builder = message::Builder::new_default();
     let mut root: test_json_types::Builder<'_> = builder.init_root();
