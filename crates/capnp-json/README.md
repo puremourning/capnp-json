@@ -23,7 +23,7 @@ Add the dependency:
 ```toml
 [dependencies]
 capnp = "0.27"
-capnp-json = "0.3.2"
+capnp-json = "0.3.3"
 ```
 
 Encoding a message reader to a JSON string, and decoding JSON back into a
