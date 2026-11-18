@@ -1602,14 +1602,14 @@ mod tests {
       panic!("Expected error");
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
-    assert_eq!(e.extra, "FailingCodec decode");
+    assert_eq!(e.extra(), "FailingCodec decode");
 
     let result = codec.encode(root.reborrow_as_reader());
     let Err(e) = result else {
       panic!("Expected error");
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
-    assert_eq!(e.extra, "FailingCodec encode");
+    assert_eq!(e.extra(), "FailingCodec encode");
 
     Ok(())
   }
@@ -1721,7 +1721,7 @@ mod tests {
       panic!("Expected error");
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
-    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    assert_eq!(e.extra(), "Recursion limit exceeded while parsing JSON");
 
     let json = r#"{"anyPointerField":{"anyPointerField":{"anyPointerField":"too deep"}}}"#;
     let result = codec.decode(json, root.reborrow());
@@ -1729,7 +1729,7 @@ mod tests {
       panic!("Expected error");
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
-    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    assert_eq!(e.extra(), "Recursion limit exceeded while parsing JSON");
 
     let json = r#"{"anyPointerField":[{"anyPointerField":{"anyPointerField":"too deep"}}]}"#;
     let result = codec.decode(json, root.reborrow());
@@ -1737,7 +1737,7 @@ mod tests {
       panic!("Expected error");
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
-    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    assert_eq!(e.extra(), "Recursion limit exceeded while parsing JSON");
 
     Ok(())
   }
@@ -1804,9 +1804,9 @@ mod tests {
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
     assert!(
-      e.extra.contains("Recursion limit exceeded"),
+      e.extra().contains("Recursion limit exceeded"),
       "unexpected error: {}",
-      e.extra
+      e.extra()
     );
     Ok(())
   }
@@ -1827,9 +1827,9 @@ mod tests {
     };
     assert_eq!(e.kind, capnp::ErrorKind::Failed);
     assert!(
-      e.extra.starts_with("cyclic JSON flattening detected"),
+      e.extra().starts_with("cyclic JSON flattening detected"),
       "unexpected error: {}",
-      e.extra
+      e.extra()
     );
   }
 
@@ -1848,7 +1848,7 @@ mod tests {
         panic!("expected {json} to be rejected");
       };
       assert_eq!(e.kind, capnp::ErrorKind::Failed);
-      assert_eq!(e.extra, "Recursion limit exceeded while decoding JSON");
+      assert_eq!(e.extra(), "Recursion limit exceeded while decoding JSON");
     }
   }
 
@@ -2005,9 +2005,9 @@ mod tests {
       panic!("expected the recursion limit to reject this");
     };
     assert!(
-      e.extra.contains("Recursion limit exceeded"),
+      e.extra().contains("Recursion limit exceeded"),
       "unexpected error: {}",
-      e.extra
+      e.extra()
     );
     Ok(())
   }
@@ -2033,7 +2033,7 @@ mod tests {
     let Err(e) = json::Codec::new().decode(&json, root) else {
       panic!("expected the recursion limit to reject this");
     };
-    assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+    assert_eq!(e.extra(), "Recursion limit exceeded while parsing JSON");
     Ok(())
   }
 
@@ -2063,7 +2063,7 @@ mod tests {
       let Err(e) = json::Codec::new().decode(&json, root) else {
         panic!("expected depth {depth} to be rejected");
       };
-      assert_eq!(e.extra, "Recursion limit exceeded while parsing JSON");
+      assert_eq!(e.extra(), "Recursion limit exceeded while parsing JSON");
     }
     Ok(())
   }
@@ -2185,9 +2185,9 @@ mod tests {
       };
       assert_eq!(e.kind, capnp::ErrorKind::Failed);
       assert!(
-        e.extra.contains("out of range"),
+        e.extra().contains("out of range"),
         "{json}: unexpected error {}",
-        e.extra
+        e.extra()
       );
     }
   }
@@ -2210,9 +2210,9 @@ mod tests {
         panic!("{json} must be rejected rather than truncated");
       };
       assert!(
-        e.extra.contains("is not an integer"),
+        e.extra().contains("is not an integer"),
         "{json}: unexpected error {}",
-        e.extra
+        e.extra()
       );
     }
   }
@@ -2273,9 +2273,9 @@ mod tests {
         panic!("{json} must be rejected; bytes outside [0, 255] are not data");
       };
       assert!(
-        e.extra.contains("Data byte"),
+        e.extra().contains("Data byte"),
         "{json}: unexpected error {}",
-        e.extra
+        e.extra()
       );
     }
 
@@ -2517,9 +2517,9 @@ mod tests {
         panic!("{json} must be rejected: unpaired surrogates are not UTF-8");
       };
       assert!(
-        e.extra.contains("surrogate"),
+        e.extra().contains("surrogate"),
         "{json}: unexpected error {}",
-        e.extra
+        e.extra()
       );
     }
   }
@@ -2615,7 +2615,7 @@ mod tests {
     let Err(e) = json::from_json(json, root) else {
       panic!("expected trailing data to be rejected");
     };
-    assert_eq!(e.extra, "Trailing characters after JSON value");
+    assert_eq!(e.extra(), "Trailing characters after JSON value");
     Ok(())
   }
 
