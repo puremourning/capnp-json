@@ -102,27 +102,16 @@ fn serialize_value_to<W>(
 where
   W: std::io::Write,
 {
-  if let Some(field_codec) =
-    meta.codec.and_then(|c| codec.registry.get(c)).or_else(|| {
-      // Consulting the override maps means hashing the field, and this runs
-      // for every value encoded. Most codecs register no overrides at all, so
-      // rule that out first.
-      if codec.field_overrides.is_empty() && codec.type_overrides.is_empty() {
-        return None;
-      }
-      meta.field.and_then(|f| {
-        codec
-          .field_overrides
-          .get(&f)
-          .or_else(|| codec.type_overrides.get(&f.get_type()))
-      })
-    })
+  if let Some(field_codec) = meta
+    .codec
+    .and_then(|c| codec.registry.get(c).map(|c| &**c))
+    .or_else(|| meta.field.and_then(|f| codec.find_override(f)))
   {
     write_json_value(writer, &field_codec.encode_value(reader)?, meta, first)
   } else {
     // No codec claimed this value, so a declared field type may reinterpret
-    // it. Same reasoning as the override maps above: skip the hash when none
-    // are registered.
+    // it. As with the overrides (see `Codec::find_override`), skip the hash
+    // when none are registered.
     //
     // Only the read is needed here. Once the AnyPointer is resolved to a
     // concrete `dynamic_value::Reader` the match below handles it like any

@@ -285,3 +285,22 @@ struct RenamedNamedUnionWithDiscriminator {
     bar @2 :Void;
   }
 }
+
+# Newtypes, for `Codec::with_newtype_override`. A group newtype gives each
+# field its own group type, so only the field's newtype ids say that `price`
+# and `bid` are both a `TestPrice`.
+type TestPrice = group {
+  lo @0 :UInt64;
+  hi @1 :UInt64;
+}
+
+type TestBid = TestPrice;
+
+type TestTag = Text;
+
+struct TestNewtypes {
+  price @[0-1] :TestPrice;
+  bid @[2-3] :TestBid;
+  tag @4 :TestTag;
+  plain @5 :Text;
+}

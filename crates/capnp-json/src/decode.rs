@@ -1142,21 +1142,8 @@ fn decode_struct(
 
     if let Some(field_codec) = field_meta
       .codec
-      .and_then(|c| codec.registry.get(c))
-      .or_else(|| {
-        // Consulting the override maps means hashing the field, and this runs
-        // for every field of every struct, present in the JSON or not. Most
-        // codecs register no overrides at all, so rule that out first.
-        if codec.field_overrides.is_empty() && codec.type_overrides.is_empty() {
-          return None;
-        }
-        field_meta.field.and_then(|f| {
-          codec
-            .field_overrides
-            .get(&f)
-            .or_else(|| codec.type_overrides.get(&f.get_type()))
-        })
-      })
+      .and_then(|c| codec.registry.get(c).map(|c| &**c))
+      .or_else(|| field_meta.field.and_then(|f| codec.find_override(f)))
     {
       let field_value = match obj.remove(value_name) {
         Some(v) => v,
@@ -1165,9 +1152,9 @@ fn decode_struct(
       return field_codec.decode_member(&field_value, sink.builder()?, field);
     }
 
-    // No codec claimed this field, so a declared type may reinterpret it. Same
-    // reasoning as the override maps above: skip the hash when no types are
-    // declared.
+    // No codec claimed this field, so a declared type may reinterpret it. As
+    // with the overrides (see `Codec::find_override`), skip the hash when no
+    // types are declared.
     //
     // The work itself lives in `decode_typed_member` rather than inline here.
     // `decode_member` is one frame of the decoder's recursion, and the
