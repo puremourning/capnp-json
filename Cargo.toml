@@ -19,9 +19,10 @@ capnpc = { package = "capnpc-newtype", version = "0.28" }
 capnp-json = { package = "capnp-json-newtype", path = "crates/capnp-json" }
 
 [workspace.metadata.release]
-# One shared version and a single `vX.Y.Z` tag for the whole workspace.
+# One shared version and a single `newtype-vX.Y.Z` tag for the whole
+# workspace. The prefix keeps the newtype branch's tags apart from main's.
 shared-version = true
-tag-name = "v{{version}}"
-allow-branch = ["main"]
-pre-release-commit-message = "Release v{{version}}"
+tag-name = "newtype-v{{version}}"
+allow-branch = ["newtype"]
+pre-release-commit-message = "Release newtype v{{version}}"
 # `capnp-json-test` has `publish = false`, so cargo-release skips it.

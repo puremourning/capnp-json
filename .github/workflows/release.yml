@@ -7,6 +7,10 @@ on:
         description: 'Version to release: an explicit SemVer (e.g. 0.2.0, no v prefix) or a bump level (patch, minor, major).'
         required: true
         type: string
+      dry-run:
+        description: Run cargo-release without --execute, and create no GitHub release.
+        type: boolean
+        default: false
 
 concurrency:
   group: release
@@ -20,12 +24,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          # All history and tags, to find the previous newtype tag.
+          fetch-depth: 0
 
-      - name: Install Cap'n Proto
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          sudo apt-get install -y capnproto libcapnp-dev
+      # This branch needs the newtype fork's capnp, not a distro one.
+      - uses: puremourning/rust-ci/setup-capnproto@v1
+        with:
+          repository: https://github.com/puremourning/capnproto
+          release: newtype-latest
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -44,20 +51,33 @@ jobs:
         run: cargo test --workspace
 
       # cargo-release bumps the workspace version, updates the README pin,
-      # commits, tags `vX.Y.Z`, pushes, and publishes to crates.io. Branch
-      # and version validation are handled by its `[workspace.metadata.release]`
-      # config (see the root Cargo.toml).
+      # commits, tags `newtype-vX.Y.Z`, pushes, and publishes to crates.io.
+      # Branch and version validation are handled by its
+      # `[workspace.metadata.release]` config (see the root Cargo.toml).
       - name: cargo release
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo release "${{ inputs.version }}" --workspace --no-confirm --execute
+          VERSION: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          execute=--execute
+          [[ "$DRY_RUN" != true ]] || execute=
+          cargo release "$VERSION" --workspace --no-confirm $execute
 
+      # Not marked latest, so main's release stays the repo's latest. Notes
+      # start from the previous newtype tag, not main's.
       - name: Create GitHub release
+        if: ${{ !inputs.dry-run }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "capnp-json") | .version')
-          gh release create "v$VERSION" \
-            --title "v$VERSION" \
-            --generate-notes
+            | jq -r '.packages[] | select(.name == "capnp-json-newtype") | .version')
+          TAG="newtype-v$VERSION"
+          PREVIOUS=$(git tag --list 'newtype-v*' --sort=-v:refname --merged HEAD \
+            | grep -vx "$TAG" | head -1 || true)
+          gh release create "$TAG" \
+            --title "capnp-json-newtype v$VERSION" \
+            --latest=false \
+            --generate-notes ${PREVIOUS:+--notes-start-tag "$PREVIOUS"}
