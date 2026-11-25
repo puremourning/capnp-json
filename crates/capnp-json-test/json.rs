@@ -2834,4 +2834,144 @@ mod tests {
     }
     Ok(())
   }
+
+  /// Writes a `TestPrice` group as `"<label>:<lo>:<hi>"`, and reads
+  /// `"<lo>:<hi>"` back into it.
+  fn price_codec(label: &'static str) -> impl json::FieldCodec {
+    json::make_field_codec(
+      move |reader| {
+        let words: capnp::dynamic_struct::Reader<'_> = reader.downcast();
+        let lo: u64 = words.get_named("lo")?.downcast();
+        let hi: u64 = words.get_named("hi")?.downcast();
+        Ok(JsonValue::String(format!("{label}:{lo}:{hi}")))
+      },
+      |value, builder| {
+        let JsonValue::String(text) = value else {
+          return Err(capnp::Error::failed("expected a string".into()));
+        };
+        let (lo, hi) = text.split_once(':').expect("lo:hi");
+        let mut words: capnp::dynamic_struct::Builder<'_> = builder.downcast();
+        words.set_named("lo", lo.parse::<u64>().unwrap().into())?;
+        words.set_named("hi", hi.parse::<u64>().unwrap().into())?;
+        Ok(())
+      },
+    )
+  }
+
+  fn constant_codec(text: &'static str) -> impl json::FieldCodec {
+    json::make_field_codec(
+      move |_reader| Ok(JsonValue::String(text.into())),
+      |_value, _builder| Ok(()),
+    )
+  }
+
+  fn build_newtypes(
+    message: &mut message::Builder<message::HeapAllocator>,
+  ) -> crate::json_test_capnp::test_newtypes::Reader<'_> {
+    let mut root =
+      message.init_root::<crate::json_test_capnp::test_newtypes::Builder<'_>>();
+    root.reborrow().get_price().set_lo(1);
+    root.reborrow().get_price().set_hi(2);
+    root.reborrow().get_bid().set_lo(3);
+    root.reborrow().get_bid().set_hi(4);
+    root.set_tag("t");
+    root.set_plain("p");
+    root.into_reader()
+  }
+
+  #[test]
+  fn newtype_override_matches_every_field_of_the_newtype() -> capnp::Result<()>
+  {
+    use crate::json_test_capnp::{test_price, test_tag};
+    let mut message = message::Builder::new_default();
+    let root = build_newtypes(&mut message);
+
+    // `bid` is a `TestBid`, which is a `TestPrice`, so it gets `TestPrice`'s
+    // codec. `plain` is `Text` like `tag`, but not a `TestTag`.
+    let codec = json::Codec::new()
+      .with_newtype_override(test_price::TYPE_ID, price_codec("price"))
+      .with_newtype_override(test_tag::TYPE_ID, constant_codec("tag"));
+    assert_eq!(
+      codec.encode(root)?,
+      r#"{"price":"price:1:2","bid":"price:3:4","tag":"tag","plain":"p"}"#
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn newtype_override_for_the_nearest_newtype_wins() -> capnp::Result<()> {
+    use crate::json_test_capnp::{test_bid, test_price};
+    let mut message = message::Builder::new_default();
+    let root = build_newtypes(&mut message);
+
+    // Registered in both orders, so that map order cannot decide it.
+    for codec in [
+      json::Codec::new()
+        .with_newtype_override(test_price::TYPE_ID, price_codec("price"))
+        .with_newtype_override(test_bid::TYPE_ID, price_codec("bid")),
+      json::Codec::new()
+        .with_newtype_override(test_bid::TYPE_ID, price_codec("bid"))
+        .with_newtype_override(test_price::TYPE_ID, price_codec("price")),
+    ] {
+      assert_eq!(
+        codec.encode(root)?,
+        r#"{"price":"price:1:2","bid":"bid:3:4","tag":"t","plain":"p"}"#
+      );
+    }
+    Ok(())
+  }
+
+  #[test]
+  fn newtype_override_is_between_field_and_type_overrides() -> capnp::Result<()>
+  {
+    use capnp::introspect::Introspect;
+
+    use crate::json_test_capnp::{test_newtypes, test_tag};
+    let mut message = message::Builder::new_default();
+    let root = build_newtypes(&mut message);
+    let capnp::introspect::TypeVariant::Struct(schema) =
+      test_newtypes::Owned::introspect().which()
+    else {
+      panic!("Expected struct");
+    };
+    let schema = capnp::schema::StructSchema::new(schema);
+    let tag = schema.get_field_by_name("tag")?;
+
+    // The `Text` type override loses to the `TestTag` newtype override on
+    // `tag`, but still applies to `plain`.
+    let codec = json::Codec::new()
+      .with_type_override(
+        capnp::text::Owned::introspect(),
+        constant_codec("type"),
+      )
+      .with_newtype_override(test_tag::TYPE_ID, constant_codec("newtype"));
+    assert_eq!(
+      codec.encode(root)?,
+      r#"{"price":{"lo":"1","hi":"2"},"bid":{"lo":"3","hi":"4"},"tag":"newtype","plain":"type"}"#
+    );
+
+    let codec = codec.with_field_override(tag, constant_codec("field"));
+    assert_eq!(
+      codec.encode(root)?,
+      r#"{"price":{"lo":"1","hi":"2"},"bid":{"lo":"3","hi":"4"},"tag":"field","plain":"type"}"#
+    );
+    Ok(())
+  }
+
+  #[test]
+  fn newtype_override_decodes_a_group() -> capnp::Result<()> {
+    use crate::json_test_capnp::{test_newtypes, test_price};
+    let codec = json::Codec::new()
+      .with_newtype_override(test_price::TYPE_ID, price_codec("price"));
+    let mut message = message::Builder::new_default();
+    let mut root = message.init_root::<test_newtypes::Builder<'_>>();
+    codec.decode(r#"{"price":"5:6","bid":"7:8"}"#, root.reborrow())?;
+    let root = root.into_reader();
+    assert_eq!(
+      (root.get_price().get_lo(), root.get_price().get_hi()),
+      (5, 6)
+    );
+    assert_eq!((root.get_bid().get_lo(), root.get_bid().get_hi()), (7, 8));
+    Ok(())
+  }
 }

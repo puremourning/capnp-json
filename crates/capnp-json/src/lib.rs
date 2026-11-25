@@ -994,7 +994,9 @@ impl Default for CodecOptions {
 ///    names registered with [`with_named_codec`](Codec::with_named_codec);
 /// 2. a [`with_field_override`](Codec::with_field_override) registered for
 ///    exactly that field;
-/// 3. a [`with_type_override`](Codec::with_type_override) registered for the
+/// 3. a [`with_newtype_override`](Codec::with_newtype_override) registered
+///    for a `type` newtype the field was declared with, the nearest first;
+/// 4. a [`with_type_override`](Codec::with_type_override) registered for the
 ///    field's declared type.
 ///
 /// If none matches and the value is a struct, a `$Rust.codec("name")`
@@ -1011,10 +1013,10 @@ impl Default for CodecOptions {
 ///
 /// # Scope of overrides
 ///
-/// Both overrides are matched against a *field*, which has two consequences
+/// All three overrides are matched against a *field*, which has two consequences
 /// worth knowing:
 ///
-/// - Neither applies to the root value passed to [`encode`](Codec::encode) or
+/// - None applies to the root value passed to [`encode`](Codec::encode) or
 ///   [`decode`](Codec::decode), since that is not reached through a field.
 ///   Use a `$Rust.codec` annotation on the struct declaration for that.
 /// - For a field of type `List(T)`, a type override must be registered for
@@ -1028,9 +1030,10 @@ impl Default for CodecOptions {
 /// the field, and the elements are then decoded as `T` by the ordinary list
 /// path rather than by consulting the declaration again.
 pub struct Codec<'env> {
-  field_overrides: HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
-  type_overrides:  HashMap<capnp::introspect::Type, Box<dyn FieldCodec + 'env>>,
-  registry:        HashMap<String, Box<dyn FieldCodec + 'env>>,
+  field_overrides:   HashMap<capnp::schema::Field, Box<dyn FieldCodec + 'env>>,
+  type_overrides: HashMap<capnp::introspect::Type, Box<dyn FieldCodec + 'env>>,
+  newtype_overrides: HashMap<u64, Box<dyn FieldCodec + 'env>>,
+  registry:          HashMap<String, Box<dyn FieldCodec + 'env>>,
 
   pub(crate) field_types:
     HashMap<capnp::schema::Field, Box<dyn FieldType + 'env>>,
@@ -1056,6 +1059,7 @@ impl<'env> Codec<'env> {
     Self {
       field_overrides: HashMap::new(),
       type_overrides: HashMap::new(),
+      newtype_overrides: HashMap::new(),
       registry: HashMap::new(),
       field_types: HashMap::new(),
       options,
@@ -1118,6 +1122,73 @@ impl<'env> Codec<'env> {
   ) -> Self {
     self.type_overrides.insert(typ, Box::new(codec));
     self
+  }
+
+  /// Use `codec` for every field declared with the `type` newtype whose id
+  /// is `newtype_id`.
+  ///
+  /// The id is the `TYPE_ID` in the newtype's generated module:
+  ///
+  /// ```ignore
+  /// // type Price = group { lo @0 :UInt64; hi @1 :UInt64; };
+  /// let codec = Codec::new()
+  ///   .with_newtype_override(my_schema_capnp::price::TYPE_ID, PriceCodec);
+  /// ```
+  ///
+  /// [`with_type_override`](Codec::with_type_override) cannot do this. A
+  /// field's declared type is what the newtype stands for, so a `Data`
+  /// newtype matches every `Data` field, and each field of a group newtype
+  /// gets a group type of its own. The newtype is recorded separately, in
+  /// [`Field::get_newtype_ids`](capnp::schema::Field::get_newtype_ids).
+  ///
+  /// A field declared with a newtype of a newtype carries both ids, and the
+  /// override for the nearest one wins: given `type Bid = Price;`, an
+  /// override for `Bid` beats one for `Price` on a field of type `Bid`, and
+  /// a field of type `Bid` still gets `Price`'s codec if `Bid` has none.
+  ///
+  /// A newtype override is more specific than a type override and less
+  /// specific than a field override; see
+  /// [which codec wins](Codec#which-codec-wins). It is matched against a
+  /// field, so [the note on scope](Codec#scope-of-overrides) applies.
+  /// Registering a second codec for the same newtype replaces the first.
+  pub fn with_newtype_override(
+    mut self,
+    newtype_id: u64,
+    codec: impl FieldCodec + 'env,
+  ) -> Self {
+    self.newtype_overrides.insert(newtype_id, Box::new(codec));
+    self
+  }
+
+  /// The override registered for `field`, if any: a field override, then a
+  /// newtype override, then a type override.
+  pub(crate) fn find_override(
+    &self,
+    field: capnp::schema::Field,
+  ) -> Option<&(dyn FieldCodec + 'env)> {
+    // This runs for every field encoded or decoded, and consulting the maps
+    // means hashing. Most codecs register no overrides at all, so rule that
+    // out first.
+    if self.field_overrides.is_empty()
+      && self.newtype_overrides.is_empty()
+      && self.type_overrides.is_empty()
+    {
+      return None;
+    }
+    self
+      .field_overrides
+      .get(&field)
+      .or_else(|| {
+        if self.newtype_overrides.is_empty() {
+          return None;
+        }
+        field
+          .get_newtype_ids()
+          .iter()
+          .find_map(|id| self.newtype_overrides.get(id))
+      })
+      .or_else(|| self.type_overrides.get(&field.get_type()))
+      .map(|codec| &**codec)
   }
 
   /// Register `codec` under `name`, for use by `$Rust.codec` annotations.
